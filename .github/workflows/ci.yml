@@ -1,0 +1,15 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # The whole engine core (search + tablebases) is pure Rust; only the PyO3 bindings
+      # need Python. Build and test without default features, so CI never touches Python.
+      - run: cargo build --release --no-default-features
+      - run: cargo test --release --no-default-features
