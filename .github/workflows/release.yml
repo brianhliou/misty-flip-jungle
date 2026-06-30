@@ -1,0 +1,34 @@
+name: release
+# Tag a version (e.g. `git tag v0.2.0 && git push --tags`) → build the x86-64 Linux
+# binary and publish it as a GitHub release asset. Downstreams can curl the binary at
+# https://github.com/brianhliou/misty-flip-jungle/releases/latest/download/jungle-flip-engine
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable, minimal)
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Build (release, x86-64 linux)
+        run: cargo build --release -p jungle-flip-engine
+      - name: Stage binary + checksum
+        run: |
+          mkdir -p dist
+          cp target/release/jungle-flip-engine dist/jungle-flip-engine
+          sha256sum dist/jungle-flip-engine | awk '{print $1}' > dist/jungle-flip-engine.sha256
+          printf 'uci\nquit\n' | ./dist/jungle-flip-engine | head -3
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/jungle-flip-engine
+            dist/jungle-flip-engine.sha256
+          generate_release_notes: true

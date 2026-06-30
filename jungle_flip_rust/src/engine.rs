@@ -299,7 +299,7 @@ impl State {
     /// Repetition key = `zkey` MINUS the no-progress clock. A position that genuinely
     /// repeats (same board, bag, side-to-move) hashes equal even though its clock
     /// advanced between visits. Used for cycle detection along a search line.
-    fn rep_key(&self) -> u64 {
+    pub fn rep_key(&self) -> u64 {
         let mut h: u64 = 0xcbf29ce484222325;
         let mut mix = |x: u64| {
             h ^= x;
@@ -358,6 +358,11 @@ pub struct Cfg<'a> {
     /// the current path is scored as a draw — a forceable cycle). Matches the platform's
     /// repetition draw rule, which the bare game model (Markov, for the tablebase) omits.
     pub rep_detect: bool,
+    /// Game-history repetition seed: `rep_key`s of positions that have already occurred
+    /// TWICE in the actual game, so a search move re-entering one is the THIRD occurrence
+    /// (a draw). Seeded into the search path at every root so threefold is honored across the
+    /// game, not just within the forward line. Empty ⇒ history-blind (legacy behavior).
+    pub rep_seed: &'a [u64],
     /// Killer + history move ordering (value-preserving — only reorders moves for more
     /// β-cutoffs, so the search reaches deeper at a fixed node budget). Disable with the
     /// `JF_NO_ORDER_HEUR` env var (for the on/off efficiency A/B).
@@ -689,7 +694,7 @@ pub fn search_value(st: &State, depth: i32, w_mob: f64, values: [f64; 8]) -> f64
     let cfg = Cfg {
         w_mob, values, contempt: 0.0, root: st.mover_color(),
         quiesce: false, quiesce_max: 0, db: None, db_max: 0, dom_term: false, rep_detect: false,
-        order_heur: false,
+        rep_seed: &[], order_heur: false,
     };
     let mut ctx = Ctx { nodes: 0, budget: u64::MAX, tt: std::collections::HashMap::new(), path: Vec::new(),
         killers: vec![[(255u8, 255u8); 2]; 128], history: [[0u32; NSQ]; NSQ] };
@@ -703,7 +708,7 @@ pub fn search_nodes(st: &State, depth: i32, w_mob: f64, values: [f64; 8]) -> u64
     let cfg = Cfg {
         w_mob, values, contempt: 0.0, root: st.mover_color(),
         quiesce: true, quiesce_max: 8, db: None, db_max: 0, dom_term: false, rep_detect: false,
-        order_heur: std::env::var("JF_NO_ORDER_HEUR").is_err(),
+        rep_seed: &[], order_heur: std::env::var("JF_NO_ORDER_HEUR").is_err(),
     };
     let mut ctx = Ctx { nodes: 0, budget: u64::MAX, tt: std::collections::HashMap::new(), path: Vec::new(),
         killers: vec![[(255u8, 255u8); 2]; 128], history: [[0u32; NSQ]; NSQ] };
@@ -721,6 +726,8 @@ fn best_at_depth(st: &State, depth: i32, cfg: &Cfg, ctx: &mut Ctx, hint: Option<
     if cfg.rep_detect {
         ctx.path.clear();
         ctx.path.push(st.rep_key()); // the root is an ancestor of every line
+        // Game-history positions already seen twice: re-entering one is the threefold draw.
+        ctx.path.extend_from_slice(cfg.rep_seed);
     }
     for m in moves {
         let v = move_value(st, m, depth, alpha, VMAX, cfg, ctx)?;
@@ -744,7 +751,7 @@ pub fn search_eval(
 ) -> f64 {
     let cfg = Cfg {
         w_mob, values, contempt, root: st.mover_color(),
-        quiesce: true, quiesce_max: 8, db, db_max, dom_term, rep_detect,
+        quiesce: true, quiesce_max: 8, db, db_max, dom_term, rep_detect, rep_seed: &[],
         order_heur: std::env::var("JF_NO_ORDER_HEUR").is_err(),
     };
     let mut scratch: Vec<(u8, u8)> = Vec::new();
@@ -773,10 +780,11 @@ pub fn search_eval(
 pub fn best_move(
     st: &State, node_budget: u64, contempt: f64, w_mob: f64, values: [f64; 8], max_depth: i32,
     db: Option<&HashMap<u128, i8>>, db_max: usize, dom_term: bool, rep_detect: bool,
+    rep_seed: &[u64],
 ) -> (u8, u8) {
     let cfg = Cfg {
         w_mob, values, contempt, root: st.mover_color(),
-        quiesce: true, quiesce_max: 8, db, db_max, dom_term, rep_detect,
+        quiesce: true, quiesce_max: 8, db, db_max, dom_term, rep_detect, rep_seed,
         order_heur: std::env::var("JF_NO_ORDER_HEUR").is_err(),
     };
     let mut mv: Vec<(u8, u8)> = Vec::new();

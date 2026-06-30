@@ -1,28 +1,10 @@
-[package]
-name = "jungle_flip_rust"
-version = "0.1.0"
-edition = "2021"
-description = "A Flip Jungle (翻翻棋, hidden-identity animal chess) engine in Rust: αβ + Star1 chance-node search and exact endgame tablebases."
-license = "MIT"
-repository = "https://github.com/brianhliou/misty-flip-jungle"
-
-[lib]
-name = "jungle_flip_rust"
-crate-type = ["cdylib", "rlib"]
-
-# Standalone tablebase builder — runs on a server with just the Rust toolchain, no
-# Python/maturin: `cargo run --release --no-default-features --bin build_tb -- <max_pieces> <out>`.
-[[bin]]
-name = "build_tb"
-path = "src/bin/build_tb.rs"
-
-[dependencies]
-pyo3 = { version = "0.29", features = ["extension-module"], optional = true }
-rayon = "1"
-
-[features]
-default = ["pyext"]
-pyext = ["dep:pyo3"]
+# Workspace: the engine core + Python (PyO3) bindings (`jungle_flip_rust`) and the
+# standalone UCI binary (`jungle-flip-engine`). The binary `#[path]`-includes the engine
+# core directly, so it has no crate dependency on `jungle_flip_rust` and builds without
+# Python — `cargo build -p jungle-flip-engine` never compiles the PyO3 extension.
+[workspace]
+members = ["jungle_flip_rust", "jungle-flip-engine"]
+resolver = "2"
 
 [profile.release]
 lto = true

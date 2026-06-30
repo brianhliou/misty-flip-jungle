@@ -184,7 +184,9 @@ mod pyext {
         let st = mk_masked(squares, bag, first_color, ply, no_progress);
         let guard = DB.lock().unwrap();
         let db = if db_max > 0 { guard.as_ref() } else { None };
-        engine::best_move(&st, node_budget, contempt, w_mob, vals8(values), max_depth, db, db_max, dom_term, rep_detect)
+        // The Python binding tracks repetition on its own side; the UCI binary is what
+        // seeds game history (see jungle-flip-engine/src/main.rs), so pass no seed here.
+        engine::best_move(&st, node_budget, contempt, w_mob, vals8(values), max_depth, db, db_max, dom_term, rep_detect, &[])
     }
 
     /// Root search VALUE (stm-perspective, in (-1,1)) at the deepest depth under the budget.

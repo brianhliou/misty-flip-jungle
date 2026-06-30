@@ -1,0 +1,12 @@
+[package]
+name = "jungle-flip-engine"
+version = "0.2.0"
+edition = "2021"
+authors = ["Brian Liou"]
+description = "MistyJungleFlip — standalone Flip Jungle (兽棋/翻翻棋, 4×4) UCI engine. Tier-B sibling of banqi-engine."
+license = "MIT"
+repository = "https://github.com/brianhliou/misty-flip-jungle"
+
+[[bin]]
+name = "jungle-flip-engine"
+path = "src/main.rs"
