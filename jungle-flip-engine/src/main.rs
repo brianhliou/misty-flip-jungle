@@ -1,4 +1,4 @@
-//! MistyJungleFlip — standalone Flip Jungle (兽棋/翻翻棋, 4×4) UCI engine, v0.1.0.
+//! MistyJungleFlip — standalone Flip Jungle (兽棋/翻翻棋, 4×4) UCI engine.
 //!
 //! Tier-B sibling of `banqi-engine`: a tiny UCI front-end over the SAME αβ + Star1
 //! chance-node + TT + quiescence search the PyO3 lib + Python bakeoffs use
@@ -65,16 +65,21 @@
 mod game;
 
 #[path = "../../jungle_flip_rust/src/endgame.rs"]
-#[allow(dead_code)] // endgame.rs is reached only via the (unused, db=None) tablebase leaf
+#[allow(dead_code)] // endgame.rs also exposes builder internals unused here
 mod endgame;
+
+#[path = "../../jungle_flip_rust/src/flatdb.rs"]
+#[allow(dead_code)] // flatdb.rs also exposes builder internals unused here
+mod flatdb;
 
 #[path = "../../jungle_flip_rust/src/engine.rs"]
 #[allow(dead_code)] // engine.rs also exposes PyO3-facing helpers, unused here
 mod engine;
 
+use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 
-const ENGINE_NAME: &str = "MistyJungleFlip 0.2.0";
+const ENGINE_NAME: &str = "MistyJungleFlip 0.4.0";
 const DEFAULT_MOVETIME_MS: u64 = 1000;
 const DEFAULT_NODES: u64 = 512_000;
 /// Derived node ceiling per millisecond of `movetime` (the search has no in-line wall
@@ -83,15 +88,82 @@ const DEFAULT_NODES: u64 = 512_000;
 const NODES_PER_MS: u64 = 1_000_000;
 
 // ── Engine knobs — pinned to RustJungleFlipStrategy's defaults so the binary reproduces
-// the Python engine's choice byte-for-byte (see strategy.py / search.py). The endgame
-// tablebase is intentionally OFF here (db=None): the binary builds no DB at startup, so
-// the golden test runs the Python strategy with endgame_db=0 to match.
+// the Python engine's choice byte-for-byte (see strategy.py / search.py).
 const DEFAULT_VALUES: [f64; 8] = [6.0, 2.0, 3.0, 4.0, 5.0, 7.0, 8.0, 10.0]; // rat..elephant
 const W_MOB: f64 = 0.8;
 const CONTEMPT: f64 = 0.05;
 const MAX_DEPTH: i32 = 24;
 const DOM_TERM: bool = false;
 const REP_DETECT: bool = true;
+// Exact retrograde endgame tablebase, used as a search leaf for fully-revealed positions
+// with ≤ this many pieces. Without it the heuristic eval can't tell a dead-drawn endgame
+// (e.g. two equal lions) from a live one, so contempt makes the engine FLEE the trade and
+// shuffle to the repetition/no-progress draw instead of securing it. The DB scores those
+// leaves as exact draws so all endgame moves tie and move-ordering takes the trade.
+//
+// The preferred source is a PREBUILT flat artifact (WLD + distance-to-mate, format v2,
+// built by `build_tb`): the binary looks for it at `$JUNGLE_FLIP_TB`, then next to the
+// executable as `jungle_flip_tb_4.bin`. A ≤4 artifact is ~97 MB and loads in ~20 ms, so
+// the per-move spawn carries it free. When no artifact is found the binary falls back to
+// building the ≤2 table at startup (~instant), which still covers the dead-drawn
+// 2-piece case. 0 disables the fallback leaf entirely.
+const DB_FALLBACK_PIECES: usize = 2;
+// Distance-aware win/loss scoring: a win D plies away scores 1.0 − 0.001·min(D, 100), at
+// true terminals and tablebase leaves alike, so the shortest forced win strictly outranks
+// longer ones (and forced losses are dragged out). Without it every winning move ties at
+// the same value and the engine can hold a won endgame forever without finishing it —
+// it shuffles until the repetition rule draws the game.
+const WIN_DIST: bool = true;
+const TB_FILENAME: &str = "jungle_flip_tb_4.bin";
+
+/// The search-leaf tablebase resolved at startup: a prebuilt flat artifact when found,
+/// else the ≤2 HashMap built in-process.
+enum LeafDb {
+    Flat(flatdb::FlatDB),
+    Map(HashMap<u128, (i8, u16)>),
+}
+
+impl LeafDb {
+    fn as_ref(&self) -> engine::DbRef<'_> {
+        match self {
+            LeafDb::Flat(f) => engine::DbRef::Flat(f),
+            LeafDb::Map(m) => engine::DbRef::Map(m),
+        }
+    }
+}
+
+/// Locate + load the leaf tablebase. Returns `(db, db_max)`. Diagnostics go to stderr
+/// (stdout is the UCI channel).
+fn init_db() -> (Option<LeafDb>, usize) {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(p) = std::env::var("JUNGLE_FLIP_TB") {
+        candidates.push(p.into());
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join(TB_FILENAME));
+        }
+    }
+    for path in candidates {
+        if !path.is_file() {
+            continue;
+        }
+        match flatdb::FlatDB::load(&path.to_string_lossy()) {
+            Ok(db) => {
+                let mp = db.max_pieces();
+                eprintln!("info tablebase {} (<= {mp} pieces, WLD+DTM)", path.display());
+                return (Some(LeafDb::Flat(db)), mp);
+            }
+            Err(e) => eprintln!("info tablebase {} unusable: {e}", path.display()),
+        }
+    }
+    if DB_FALLBACK_PIECES > 0 {
+        eprintln!("info tablebase none found; building <= {DB_FALLBACK_PIECES} in-process");
+        (Some(LeafDb::Map(endgame::build(DB_FALLBACK_PIECES).0)), DB_FALLBACK_PIECES)
+    } else {
+        (None, 0)
+    }
+}
 
 // ── Role-char codec ──────────────────────────────────────────────────────────────
 // Index 0..7 = rat,cat,dog,wolf,leopard,tiger,lion,elephant (role IS rank-1).
@@ -300,7 +372,13 @@ fn state_of(p: &Parsed) -> engine::State {
     }
 }
 
-fn search_best(p: &Parsed, node_budget: u64, rep_seed: &[u64]) -> String {
+fn search_best(
+    p: &Parsed,
+    node_budget: u64,
+    rep_seed: &[u64],
+    db: Option<engine::DbRef>,
+    db_max: usize,
+) -> String {
     let st = state_of(p);
     let (frm, to) = engine::best_move(
         &st,
@@ -309,10 +387,11 @@ fn search_best(p: &Parsed, node_budget: u64, rep_seed: &[u64]) -> String {
         W_MOB,
         DEFAULT_VALUES,
         MAX_DEPTH,
-        None, // no endgame tablebase in the binary (v1)
-        0,
+        db,
+        db_max,
         DOM_TERM,
         REP_DETECT,
+        WIN_DIST,
         rep_seed,
     );
     if frm == 255 {
@@ -332,6 +411,9 @@ fn parse_rep_seed(reps: &str) -> Vec<u64> {
 }
 
 fn main() {
+    // Resolve the exact-tablebase search leaf once at startup (prebuilt flat artifact
+    // preferred; ≤2 in-process fallback). See DB_FALLBACK_PIECES / WIN_DIST.
+    let (db, db_max) = init_db();
     let stdin = io::stdin();
     let mut current: Option<Parsed> = None;
     let mut current_reps: Vec<u64> = Vec::new();
@@ -384,7 +466,7 @@ fn main() {
                     budget = budget.min(mt.saturating_mul(NODES_PER_MS).max(1));
                 }
                 let mv = match &current {
-                    Some(p) => search_best(p, budget, &current_reps),
+                    Some(p) => search_best(p, budget, &current_reps, db.as_ref().map(LeafDb::as_ref), db_max),
                     None => "(none)".to_string(),
                 };
                 println!("bestmove {mv}");
@@ -494,17 +576,51 @@ mod fen_tests {
         let p = state_from_fen(root).expect("root");
 
         // History-blind (legacy): the engine plays the shuffle, blind to the repetition.
-        let blind = search_best(&p, 512_000, &[]);
+        let blind = search_best(&p, 512_000, &[], None, 0);
         assert_eq!(blind, "a0a1", "without a rep seed the engine repeats");
 
         // Seed Q as already-seen: a0a1 now scores as a draw, so the engine must deviate.
         let seed = parse_rep_seed(q);
-        let aware = search_best(&p, 512_000, &seed);
+        let aware = search_best(&p, 512_000, &seed, None, 0);
         assert_ne!(aware, "a0a1", "with the rep seed the engine avoids the threefold move");
 
         // A valid but unrelated seed must not perturb the move (no false positives).
         let unrelated = parse_rep_seed("L3/4/4/l3 b - 0 5");
         assert!(!unrelated.is_empty(), "control seed must actually parse");
-        assert_eq!(search_best(&p, 512_000, &unrelated), "a0a1");
+        assert_eq!(search_best(&p, 512_000, &unrelated, None, 0), "a0a1");
+    }
+
+    #[test]
+    fn endgame_db_leaf_takes_the_drawn_trade_instead_of_fleeing() {
+        // Two equal lions (red a1 to move, black a2 adjacent) is a dead draw whose only clean
+        // finish is the mutual-KO trade a0a1. From a live game: the engine fled this trade
+        // 13 times and ran to the repetition cap.
+        let p = state_from_fen("4/4/l3/L3 r - 1 60").expect("two-lion endgame");
+
+        // db=None (the shipped v0.2.0 behaviour): contempt makes the engine flee the trade.
+        let fled = search_best(&p, 512_000, &[], None, 0);
+        assert_ne!(fled, "a0a1", "without the DB leaf the engine flees the trade");
+
+        // ≤2 exact tablebase leaf: the dead draw is recognised, all moves tie, and move
+        // ordering takes the trade — securing the draw immediately.
+        let db = endgame::build(2).0;
+        let secured = search_best(&p, 512_000, &[], Some(engine::DbRef::Map(&db)), 2);
+        assert_eq!(secured, "a0a1", "the DB leaf makes the engine take the drawn trade");
+    }
+
+    #[test]
+    fn win_dist_converts_the_won_endgame() {
+        // Black tiger d2 + rat b3 vs a lone red elephant d4, black to move: a forced black
+        // win in 3 (rat b3-c3 covers both elephant escape squares; an elephant can't capture
+        // a rat). Under flat WLD scoring every winning move tied and the engine shuffled this
+        // to a repetition draw in a published self-play game; with WIN_DIST it must play the
+        // trap immediately. UCI ranks are 0-indexed: b3-c3 is "b2c2".
+        let p = state_from_fen("3E/1r2/3t/4 b - 0 47").expect("won 3-piece endgame");
+        let db = endgame::build(2).0;
+        assert_eq!(
+            search_best(&p, 512_000, &[], Some(engine::DbRef::Map(&db)), 2),
+            "b2c2",
+            "distance-aware scoring takes the shortest forced win"
+        );
     }
 }

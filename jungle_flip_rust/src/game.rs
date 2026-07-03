@@ -6,6 +6,8 @@
 //! chance here — these are fully-revealed deterministic positions.
 
 pub const NSQ: usize = 16;
+/// Upper-bound sentinel during tablebase DTM relaxation (far above any real 4x4 distance).
+pub const DTM_BIG: u16 = u16::MAX / 4;
 pub const W: i32 = 4;
 pub const H: i32 = 4;
 pub const EMPTY: i8 = -1;

@@ -5,8 +5,10 @@
 
 A Flip Jungle (翻翻棋, hidden-identity animal chess) engine in Rust: alpha-beta search with
 Star1 chance-node pruning, a transposition table, quiescence, and killer/history move ordering,
-plus exact endgame tablebases by retrograde analysis. No neural network. The search core is
-exposed to Python via PyO3, and the tablebase builder ships as a standalone binary.
+plus exact endgame tablebases by retrograde analysis, storing the result and the distance to it.
+Wins are scored by distance, so the engine finishes a won endgame by the shortest forced line
+instead of holding the win forever. No neural network. The search core is exposed to Python via
+PyO3, and the tablebase builder ships as a standalone binary.
 
 Flip Jungle is a 4×4 game with sixteen animals, eight a side, all starting face-down. On your
 turn you flip a tile, which reveals a random animal, or move a face-up animal one square.
@@ -33,7 +35,10 @@ cargo build --release --no-default-features --bin build_tb
 ```
 
 It solves every position up to `<max_pieces>` by retrograde analysis, parallelized across cores,
-and writes a flat two-bit tablebase. Strength is a node budget, so search results are reproducible
+and writes a flat tablebase: two bits of result plus a byte of distance-to-mate per position. The
+UCI engine loads a prebuilt table from `$JUNGLE_FLIP_TB` or `jungle_flip_tb_4.bin` next to the
+executable (a ≤4 table ships as a release asset), and falls back to building the ≤2 table at
+startup when none is found. Strength is a node budget, so search results are reproducible
 across machines.
 
 The Python bindings (the `jungle_flip_rust` module: search, move generation, tablebase queries)

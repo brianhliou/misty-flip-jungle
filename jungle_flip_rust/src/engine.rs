@@ -298,7 +298,8 @@ impl State {
 
     /// Repetition key = `zkey` MINUS the no-progress clock. A position that genuinely
     /// repeats (same board, bag, side-to-move) hashes equal even though its clock
-    /// advanced between visits. Used for cycle detection along a search line.
+    /// advanced between visits. Used for cycle detection along a search line, and by the
+    /// UCI binary to hash the game-history `reps` seed.
     pub fn rep_key(&self) -> u64 {
         let mut h: u64 = 0xcbf29ce484222325;
         let mut mix = |x: u64| {
@@ -327,7 +328,20 @@ const INF: f64 = f64::INFINITY;
 /// How far a DB win/loss leaf sits from a true terminal (±1.0). Small, so a forced win
 /// dominates every heuristic eval, but a material gradient still breaks ties among won
 /// children (WDL has no distance-to-mate, so material proxies "closer to finishing").
+/// Legacy grading — only used when `win_dist` is off.
 const DB_MARGIN: f64 = 0.05;
+/// Distance-aware scoring (the `win_dist` flag): a win D plies from the ROOT scores
+/// `1.0 − DIST_SLOPE·min(D, DIST_CAP)`, losses mirrored (prefer longer losses), whether
+/// the line ends at a true terminal (D = plies searched) or a DB leaf (D = plies searched
+/// + DTM). Shorter wins strictly outrank longer ones, which is what converts won endgames
+/// instead of shuffling to the repetition draw (the WLD-no-distance dawdle class). Wins
+/// live in [1−slope·cap, 1] = [0.90, 1.0]; the heuristic eval is clamped to ±EVAL_CLAMP
+/// so the bands never overlap (raw tanh eval can reach ±0.97 on extreme material).
+const DIST_SLOPE: f64 = 0.001;
+const DIST_CAP: f64 = 100.0;
+const EVAL_CLAMP: f64 = 0.85;
+/// |v| above this is treated as a forced win/loss for TT distance adjustment.
+const WIN_BAND: f64 = 0.89;
 /// Dynamic-domination constants (unique-piece game). A rat captures ONLY the elephant, so
 /// once the enemy elephant is gone the rat can take nothing — it collapses to ~dead weight.
 /// An elephant's sole predator is the rat, so once the enemy rat is gone the elephant is
@@ -341,6 +355,31 @@ const TT_EXACT: u8 = 0;
 const TT_LOWER: u8 = 1;
 const TT_UPPER: u8 = 2;
 
+/// A tablebase the search can probe: the in-memory HashMap (build_db) or the flat
+/// perfect-index artifact (build_tb / load_flat_db). Both yield `(wld, dtm)`.
+#[derive(Clone, Copy)]
+pub enum DbRef<'a> {
+    Map(&'a HashMap<u128, (i8, u16)>),
+    Flat(&'a crate::flatdb::FlatDB),
+}
+
+impl<'a> DbRef<'a> {
+    #[inline]
+    fn probe(&self, board: &[i8; crate::game::NSQ], stm: i8) -> Option<(i8, u16)> {
+        match self {
+            DbRef::Map(m) => m.get(&crate::endgame::key_of(board, stm)).copied(),
+            DbRef::Flat(f) => {
+                let (v, d) = f.value_dtm(board, stm);
+                if v == 2 {
+                    None
+                } else {
+                    Some((v, d))
+                }
+            }
+        }
+    }
+}
+
 pub struct Cfg<'a> {
     pub w_mob: f64,
     pub values: [f64; 8],
@@ -348,20 +387,24 @@ pub struct Cfg<'a> {
     pub root: i16,
     pub quiesce: bool,
     pub quiesce_max: i32,
-    /// Optional exact endgame tablebase (clockless WLD from stm's view) used as a search
-    /// leaf, plus the max piece count it covers. `None` ⇒ pure heuristic search.
-    pub db: Option<&'a HashMap<u128, i8>>,
+    /// Optional exact endgame tablebase (clockless WLD+DTM from stm's view) used as a
+    /// search leaf, plus the max piece count it covers. `None` ⇒ pure heuristic search.
+    pub db: Option<DbRef<'a>>,
     pub db_max: usize,
+    /// Distance-aware win/loss scoring (see DIST_SLOPE). Off ⇒ legacy flat ±1.0 terminals
+    /// and material-graded DB leaves.
+    pub win_dist: bool,
+    /// Absolute ply of the search root — distances are measured from here.
+    pub root_ply: u32,
     /// Enable the dynamic rat/elephant domination term in the eval.
     pub dom_term: bool,
     /// Detect threefold-style repetition along the search line (a position that recurs on
     /// the current path is scored as a draw — a forceable cycle). Matches the platform's
     /// repetition draw rule, which the bare game model (Markov, for the tablebase) omits.
     pub rep_detect: bool,
-    /// Game-history repetition seed: `rep_key`s of positions that have already occurred
-    /// TWICE in the actual game, so a search move re-entering one is the THIRD occurrence
-    /// (a draw). Seeded into the search path at every root so threefold is honored across the
-    /// game, not just within the forward line. Empty ⇒ history-blind (legacy behavior).
+    /// rep_keys of game-history positions already seen twice (re-entering one is the
+    /// threefold draw). Seeded into the search path at every root so threefold is honored
+    /// across the game, not just within the forward line. Empty ⇒ history-blind.
     pub rep_seed: &'a [u64],
     /// Killer + history move ordering (value-preserving — only reorders moves for more
     /// β-cutoffs, so the search reaches deeper at a fixed node budget). Disable with the
@@ -405,12 +448,24 @@ fn db_probe(st: &State, cfg: &Cfg) -> Option<f64> {
     if npieces == 0 || npieces > cfg.db_max {
         return None;
     }
-    let key = crate::endgame::key_of(&board, stm as i8);
-    let wld = *db.get(&key)?;
-    Some(grade_db(wld, st, cfg))
+    let (wld, dtm) = db.probe(&board, stm as i8)?;
+    Some(grade_db(wld, dtm, st, cfg))
 }
 
-fn grade_db(wld: i8, st: &State, cfg: &Cfg) -> f64 {
+/// Root-relative plies from the search root to `st`.
+#[inline]
+fn dist_from_root(st: &State, cfg: &Cfg) -> f64 {
+    st.ply.saturating_sub(cfg.root_ply) as f64
+}
+
+/// Win/loss value at total root-distance `d` plies (win_dist scoring): shorter wins score
+/// higher, longer losses score higher (less negative).
+#[inline]
+fn dist_value(sign: f64, d: f64) -> f64 {
+    sign * (VMAX - DIST_SLOPE * d.min(DIST_CAP))
+}
+
+fn grade_db(wld: i8, dtm: u16, st: &State, cfg: &Cfg) -> f64 {
     if wld == 0 {
         // exact draw — mirror the drawn-terminal contempt treatment.
         if cfg.contempt != 0.0 && cfg.root >= 0 {
@@ -419,6 +474,10 @@ fn grade_db(wld: i8, st: &State, cfg: &Cfg) -> f64 {
         return 0.0;
     }
     let sign = wld as f64; // +1 win / -1 loss from stm's view
+    if cfg.win_dist {
+        // total distance from the root = plies already searched + tablebase DTM
+        return dist_value(sign, dist_from_root(st, cfg) + dtm as f64);
+    }
     let mat = st.eval(st.mover_color(), cfg.w_mob, &cfg.values, cfg.dom_term);
     sign * (1.0 - DB_MARGIN) + DB_MARGIN * mat
 }
@@ -451,10 +510,23 @@ fn terminal_value(st: &State, res: i16, cfg: &Cfg) -> f64 {
         }
         return 0.0;
     }
-    if res == st.mover_color() {
-        1.0
+    let sign = if res == st.mover_color() { 1.0 } else { -1.0 };
+    if cfg.win_dist {
+        // the game ended `dist_from_root` plies into the search
+        return dist_value(sign, dist_from_root(st, cfg));
+    }
+    sign
+}
+
+/// Heuristic leaf eval, clamped under win_dist so it can never outrank a forced win
+/// (raw tanh eval reaches ±0.97 on extreme material; the win band starts at 0.90).
+#[inline]
+fn leaf_eval(st: &State, cfg: &Cfg) -> f64 {
+    let v = st.eval(st.mover_color(), cfg.w_mob, &cfg.values, cfg.dom_term);
+    if cfg.win_dist {
+        v.clamp(-EVAL_CLAMP, EVAL_CLAMP)
     } else {
-        -1.0
+        v
     }
 }
 
@@ -505,7 +577,7 @@ fn quiesce(st: &State, mut alpha: f64, beta: f64, cfg: &Cfg, ctx: &mut Ctx, qdep
     if let Some(v) = db_probe(st, cfg) {
         return Ok(v);
     }
-    let stand = st.eval(st.mover_color(), cfg.w_mob, &cfg.values, cfg.dom_term);
+    let stand = leaf_eval(st, cfg);
     if stand >= beta || qdepth <= 0 {
         return Ok(stand);
     }
@@ -605,7 +677,7 @@ fn negamax(st: &State, depth: i32, mut alpha: f64, beta: f64, cfg: &Cfg, ctx: &m
         if cfg.quiesce {
             return quiesce(st, alpha, beta, cfg, ctx, cfg.quiesce_max);
         }
-        return Ok(st.eval(st.mover_color(), cfg.w_mob, &cfg.values, cfg.dom_term));
+        return Ok(leaf_eval(st, cfg));
     }
 
     let key = st.zkey();
@@ -613,7 +685,31 @@ fn negamax(st: &State, depth: i32, mut alpha: f64, beta: f64, cfg: &Cfg, ctx: &m
     let beta_orig = beta;
     let mut beta = beta;
     let mut tt_best = None;
+    // Under win_dist, forced win/loss values are root-distance-dependent, but the same
+    // zkey can be reached at different plies from the root (zkey hashes ply%2 only). TT
+    // entries therefore store NODE-relative win/loss values (as if the node were the
+    // root); convert at the boundary — the standard mate-distance-scoring treatment.
+    let tt_adj = if cfg.win_dist { DIST_SLOPE * dist_from_root(st, cfg) } else { 0.0 };
+    let from_tt = |v: f64| -> f64 {
+        if v > WIN_BAND {
+            (v - tt_adj).max(WIN_BAND)
+        } else if v < -WIN_BAND {
+            (v + tt_adj).min(-WIN_BAND)
+        } else {
+            v
+        }
+    };
+    let to_tt = |v: f64| -> f64 {
+        if v > WIN_BAND {
+            (v + tt_adj).min(VMAX)
+        } else if v < -WIN_BAND {
+            (v - tt_adj).max(VMIN)
+        } else {
+            v
+        }
+    };
     if let Some(&(ed, ev, ef, eb)) = ctx.tt.get(&key) {
+        let ev = from_tt(ev);
         if ed >= depth {
             match ef {
                 TT_EXACT => return Ok(ev),
@@ -684,7 +780,7 @@ fn negamax(st: &State, depth: i32, mut alpha: f64, beta: f64, cfg: &Cfg, ctx: &m
         None => true,
     };
     if replace {
-        ctx.tt.insert(key, (depth, best, flag, best_move));
+        ctx.tt.insert(key, (depth, to_tt(best), flag, best_move));
     }
     Ok(best)
 }
@@ -694,7 +790,8 @@ pub fn search_value(st: &State, depth: i32, w_mob: f64, values: [f64; 8]) -> f64
     let cfg = Cfg {
         w_mob, values, contempt: 0.0, root: st.mover_color(),
         quiesce: false, quiesce_max: 0, db: None, db_max: 0, dom_term: false, rep_detect: false,
-        rep_seed: &[], order_heur: false,
+        win_dist: false, root_ply: st.ply, rep_seed: &[],
+        order_heur: false,
     };
     let mut ctx = Ctx { nodes: 0, budget: u64::MAX, tt: std::collections::HashMap::new(), path: Vec::new(),
         killers: vec![[(255u8, 255u8); 2]; 128], history: [[0u32; NSQ]; NSQ] };
@@ -708,7 +805,8 @@ pub fn search_nodes(st: &State, depth: i32, w_mob: f64, values: [f64; 8]) -> u64
     let cfg = Cfg {
         w_mob, values, contempt: 0.0, root: st.mover_color(),
         quiesce: true, quiesce_max: 8, db: None, db_max: 0, dom_term: false, rep_detect: false,
-        rep_seed: &[], order_heur: std::env::var("JF_NO_ORDER_HEUR").is_err(),
+        win_dist: false, root_ply: st.ply, rep_seed: &[],
+        order_heur: std::env::var("JF_NO_ORDER_HEUR").is_err(),
     };
     let mut ctx = Ctx { nodes: 0, budget: u64::MAX, tt: std::collections::HashMap::new(), path: Vec::new(),
         killers: vec![[(255u8, 255u8); 2]; 128], history: [[0u32; NSQ]; NSQ] };
@@ -747,11 +845,12 @@ fn best_at_depth(st: &State, depth: i32, cfg: &Cfg, ctx: &mut Ctx, hint: Option<
 #[allow(clippy::too_many_arguments)]
 pub fn search_eval(
     st: &State, node_budget: u64, contempt: f64, w_mob: f64, values: [f64; 8], max_depth: i32,
-    db: Option<&HashMap<u128, i8>>, db_max: usize, dom_term: bool, rep_detect: bool,
+    db: Option<DbRef>, db_max: usize, dom_term: bool, rep_detect: bool, win_dist: bool,
 ) -> f64 {
     let cfg = Cfg {
         w_mob, values, contempt, root: st.mover_color(),
-        quiesce: true, quiesce_max: 8, db, db_max, dom_term, rep_detect, rep_seed: &[],
+        quiesce: true, quiesce_max: 8, db, db_max, dom_term, rep_detect,
+        win_dist, root_ply: st.ply, rep_seed: &[],
         order_heur: std::env::var("JF_NO_ORDER_HEUR").is_err(),
     };
     let mut scratch: Vec<(u8, u8)> = Vec::new();
@@ -779,12 +878,13 @@ pub fn search_eval(
 #[allow(clippy::too_many_arguments)]
 pub fn best_move(
     st: &State, node_budget: u64, contempt: f64, w_mob: f64, values: [f64; 8], max_depth: i32,
-    db: Option<&HashMap<u128, i8>>, db_max: usize, dom_term: bool, rep_detect: bool,
+    db: Option<DbRef>, db_max: usize, dom_term: bool, rep_detect: bool, win_dist: bool,
     rep_seed: &[u64],
 ) -> (u8, u8) {
     let cfg = Cfg {
         w_mob, values, contempt, root: st.mover_color(),
-        quiesce: true, quiesce_max: 8, db, db_max, dom_term, rep_detect, rep_seed,
+        quiesce: true, quiesce_max: 8, db, db_max, dom_term, rep_detect,
+        win_dist, root_ply: st.ply, rep_seed,
         order_heur: std::env::var("JF_NO_ORDER_HEUR").is_err(),
     };
     let mut mv: Vec<(u8, u8)> = Vec::new();

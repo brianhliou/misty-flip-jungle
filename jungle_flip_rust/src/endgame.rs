@@ -1,15 +1,23 @@
 //! Retrograde endgame tablebase (Rust) — transcription of the Python-validated
 //! `endgame.py` algorithm, with colour+D4 symmetry canonicalization so far more
-//! pieces fit. Clockless exact W/L/D, built bottom-up by piece count.
+//! pieces fit. Clockless exact W/L/D + DTM, built bottom-up by piece count.
 //!
 //! Memory model: per level we keep ONE map `canonical-key -> (floor, label)` and
 //! recompute quiet children on each fixpoint pass (no stored adjacency), so memory is
 //! ~one i16 per canonical position. (≥6 pieces ultimately wants a perfect-index flat
 //! array instead of a HashMap; ≤5 is reachable this way.)
+//!
+//! DTM (distance-to-terminal, in plies, winner minimizing / loser maximizing) is
+//! computed AFTER the W/L/D labels converge, as a second per-level fixpoint: every
+//! value starts at an upper bound (`DTM_BIG`) and is recomputed from scratch each pass
+//! — win = 1 + min over losing children, loss = 1 + max over ALL children — so values
+//! only decrease and converge to the unique fixpoint ≥ the true DTM, which equals the
+//! true DTM (standard argument by induction on the true distance). Draws have no DTM
+//! (stored 0).
 
 use std::collections::HashMap;
 
-use crate::game::{apply, canonical, gen_moves, piece_count, result, EMPTY, NSQ};
+use crate::game::{apply, canonical, gen_moves, piece_count, result, DTM_BIG, EMPTY, NSQ};
 
 const UNKNOWN: i8 = 2;
 
@@ -90,11 +98,12 @@ fn placements(pick: &[i8], mut f: impl FnMut(&[i8; NSQ], i8)) {
     rec(pick, 0, &mut used, &mut board, &mut f);
 }
 
-/// Build the tablebase up to `max_pieces`. Returns `(db, per_level_stats)` where stats
-/// is `[(n, wins, losses, draws); per level]`.
-pub fn build(max_pieces: usize) -> (HashMap<u128, i8>, Vec<(usize, usize, usize, usize)>) {
+/// Build the tablebase up to `max_pieces`. Returns `(db, per_level_stats)` where each
+/// entry is `(wld, dtm)` — dtm in plies (0 for draws) — and stats is
+/// `[(n, wins, losses, draws); per level]`.
+pub fn build(max_pieces: usize) -> (HashMap<u128, (i8, u16)>, Vec<(usize, usize, usize, usize)>) {
     let codes = all_codes();
-    let mut db: HashMap<u128, i8> = HashMap::new();
+    let mut db: HashMap<u128, (i8, u16)> = HashMap::new();
     let mut stats = Vec::new();
 
     for k in 1..=max_pieces {
@@ -126,7 +135,7 @@ pub fn build(max_pieces: usize) -> (HashMap<u128, i8>, Vec<(usize, usize, usize,
                     if r != 2 {
                         floor = floor.max(-r);
                     } else if piece_count(&child) < k {
-                        let cv = db[&canonical(&child, cs)];
+                        let (cv, _) = db[&canonical(&child, cs)];
                         floor = floor.max(-cv);
                     } else {
                         has_quiet = true;
@@ -186,16 +195,77 @@ pub fn build(max_pieces: usize) -> (HashMap<u128, i8>, Vec<(usize, usize, usize,
             }
         }
 
-        // Undecided ⇒ draw; commit to db; collect stats.
+        // DTM relaxation over the converged labels: recompute-from-scratch each pass so
+        // values only decrease from the DTM_BIG upper bound (see module doc for why this
+        // converges to the exact DTM). Draws are skipped (no terminal distance).
+        let labels: HashMap<u128, i8> = level
+            .iter()
+            .map(|(&kk, v)| (kk, if v[1] == UNKNOWN { 0 } else { v[1] }))
+            .collect();
+        let mut dtm: HashMap<u128, u16> = labels
+            .iter()
+            .filter(|(_, &l)| l != 0)
+            .map(|(&kk, _)| (kk, DTM_BIG))
+            .collect();
+        loop {
+            let mut changed = false;
+            let keys: Vec<u128> = dtm.keys().copied().collect();
+            for key in keys {
+                let lab = labels[&key];
+                let (rb, rs) = unpack(key);
+                let mut mv: Vec<(u8, u8)> = Vec::new();
+                gen_moves(&rb, rs, &mut mv);
+                // no-move ⇒ terminal loss at distance 0
+                let mut new_d: u16 = if mv.is_empty() { 0 } else if lab == 1 { DTM_BIG } else { 0 };
+                for (f, t) in &mv {
+                    let mut child = rb;
+                    apply(&mut child, *f as usize, *t as usize);
+                    let cs = 1 - rs;
+                    let r = result(&child, cs);
+                    // distance contributed by this move (from the child onward)
+                    let (cval, cd) = if r != 2 {
+                        (-r, 0u16)
+                    } else if piece_count(&child) < k {
+                        let (cv, cdtm) = db[&canonical(&child, cs)];
+                        (-cv, cdtm)
+                    } else {
+                        let ck = canonical(&child, cs);
+                        (-labels[&ck], *dtm.get(&ck).unwrap_or(&0))
+                    };
+                    let total = 1 + cd.min(DTM_BIG);
+                    if lab == 1 {
+                        // win: shortest path through a losing-for-opponent child
+                        if cval == 1 && total < new_d {
+                            new_d = total;
+                        }
+                    } else {
+                        // loss: best defense = longest path (every move loses)
+                        if total > new_d {
+                            new_d = total;
+                        }
+                    }
+                }
+                let cur = dtm[&key];
+                if new_d < cur {
+                    dtm.insert(key, new_d);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // Commit to db; collect stats. Undecided ⇒ draw.
         let (mut w, mut l, mut d) = (0usize, 0usize, 0usize);
-        for (key, v) in level.iter() {
-            let val = if v[1] == UNKNOWN { 0 } else { v[1] };
+        for (key, &val) in labels.iter() {
             match val {
                 1 => w += 1,
                 -1 => l += 1,
                 _ => d += 1,
             }
-            db.insert(*key, val);
+            let dist = if val == 0 { 0 } else { dtm[key] };
+            db.insert(*key, (val, dist));
         }
         stats.push((w + l + d, w, l, d));
     }
