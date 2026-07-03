@@ -17,6 +17,14 @@ Captures go by rank, with two twists: the rat captures the elephant, and two ani
 rank trade and both come off the board. The hidden identities make a flip a chance event, so the
 search is expectiminimax (Star1), not plain alpha-beta.
 
+<p align="center">
+  <a href="https://mistboard.com/?play=computer&gameSpecId=jungle-flip">
+    <img src="assets/game.webp" alt="A full MistyFlipJungle self-play game, tiles flipping and animals trading off the board" width="360">
+  </a>
+  <br>
+  <sub><i>MistyFlipJungle self-play — tiles flip to reveal animals, and the lions and elephants trade off (同归于尽) until Black wins.</i></sub>
+</p>
+
 **Play it** against the computer on
 [mistboard.com](https://mistboard.com/?play=computer&gameSpecId=jungle-flip), where this engine
 ships as the Flip Jungle opponent ([rules](https://mistboard.com/rules/jungle-flip)).
