@@ -60,12 +60,14 @@ maturin develop --release
 
 ## Layout
 
-- `src/game.rs`: the masked 4×4 state model, move generation, and capture rules.
-- `src/engine.rs`: alpha-beta + Star1 chance-node search, with TT, quiescence, and move ordering.
-- `src/endgame.rs`: the HashMap retrograde solver used as the exact oracle.
-- `src/flatdb.rs`: the flat two-bit perfect-index tablebase and its parallel builder.
-- `src/bin/build_tb.rs`: the standalone, Python-free tablebase-builder binary.
-- `src/lib.rs`: the PyO3 bindings, behind the default `pyext` feature.
+- `jungle_flip_rust/`: the engine core and PyO3 bindings.
+  - `src/game.rs`: the masked 4×4 state model, move generation, and capture rules.
+  - `src/engine.rs`: alpha-beta + Star1 chance-node search, with TT, quiescence, and move ordering.
+  - `src/endgame.rs`: the HashMap retrograde solver used as the exact oracle.
+  - `src/flatdb.rs`: the flat two-bit perfect-index tablebase and its parallel builder.
+  - `src/bin/build_tb.rs`: the standalone, Python-free tablebase-builder binary.
+  - `src/lib.rs`: the PyO3 bindings, behind the default `pyext` feature.
+- `jungle-flip-engine/`: the UCI binary, which `#[path]`-includes the engine core.
 
 ## License
 
