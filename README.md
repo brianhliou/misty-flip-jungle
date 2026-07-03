@@ -1,6 +1,7 @@
 # MistyFlipJungle
 
 [![ci](https://github.com/brianhliou/misty-flip-jungle/actions/workflows/ci.yml/badge.svg)](https://github.com/brianhliou/misty-flip-jungle/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/brianhliou/misty-flip-jungle)](https://github.com/brianhliou/misty-flip-jungle/releases/latest)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A Flip Jungle (翻翻棋, hidden-identity animal chess) engine in Rust: alpha-beta search with
@@ -15,6 +16,10 @@ turn you flip a tile, which reveals a random animal, or move a face-up animal on
 Captures go by rank, with two twists: the rat captures the elephant, and two animals of the same
 rank trade and both come off the board. The hidden identities make a flip a chance event, so the
 search is expectiminimax (Star1), not plain alpha-beta.
+
+**Play it** against the computer on
+[mistboard.com](https://mistboard.com/?play=computer&gameSpecId=jungle-flip), where this engine
+ships as the Flip Jungle opponent ([rules](https://mistboard.com/rules/jungle-flip)).
 
 ## Strength
 
