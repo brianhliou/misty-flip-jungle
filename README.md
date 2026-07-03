@@ -20,7 +20,7 @@ Hidden identities make each flip a chance event, so the search is expectiminimax
     <img src="assets/game.webp" alt="A full MistyFlipJungle self-play game, tiles flipping and animals trading off the board" width="360">
   </a>
   <br>
-  <sub><i>MistyFlipJungle self-play: tiles flip to reveal animals, the lions and elephants trade off (同归于尽), and Black wins.</i></sub>
+  <sub><i>MistyFlipJungle self-play: both lions and both elephants trade off (同归于尽), and Black wins.</i></sub>
 </p>
 
 **Play it** against the computer on
@@ -33,8 +33,8 @@ Near-perfect where it can be checked: on solvable endgames (up to five pieces) i
 tablebase 99 to 100% of the time, and it agreed with a forward solver on all 200 midgame test
 positions. The opening, where the flips happen, is too large to solve, so play there is unverified.
 
-The build story, including what a near-perfect engine says about the game's skill ceiling, is on my
-blog: [Building a Flip Jungle Engine](https://brianhliou.com/posts/building-flip-jungle-engine/).
+Full build report:
+[Building a Flip Jungle Engine](https://brianhliou.com/posts/building-flip-jungle-engine/).
 
 ## Build
 
