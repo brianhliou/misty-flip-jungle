@@ -874,12 +874,62 @@ pub fn search_eval(
     val
 }
 
+/// Deterministic scalar hash — turns `rng_seed` into a uniform index for tie-breaking.
+fn splitmix64(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// All root moves whose value equals the best, at a fixed depth, searched with the
+/// FULL window so exact ties are visible (the narrowed root search collapses ties to
+/// α and hides them). Meant to run AFTER the strength-determining deepening, over its
+/// warm TT, so it is cheap and does not steal search depth. `ctx.nodes` is reset to
+/// give the pass its own headroom; a mid-pass budget-out falls back to `primary`.
+#[allow(clippy::float_cmp)] // exact equality is intentional: only bit-identical evals tie
+fn root_ties_at_depth(
+    st: &State, depth: i32, cfg: &Cfg, ctx: &mut Ctx, hint: Option<(u8, u8)>, primary: (u8, u8),
+) -> Vec<(u8, u8)> {
+    let kdi = (depth as usize).min(ctx.killers.len() - 1);
+    let killers_d = ctx.killers[kdi];
+    let moves = ordered_moves(st, &cfg.values, hint, &killers_d, &ctx.history);
+    if cfg.rep_detect {
+        ctx.path.clear();
+        ctx.path.push(st.rep_key());
+        ctx.path.extend_from_slice(cfg.rep_seed);
+    }
+    ctx.nodes = 0; // headroom for the post-search pass (mostly TT hits)
+    let mut best = -INF;
+    let mut ties: Vec<(u8, u8)> = Vec::new();
+    for m in moves {
+        match move_value(st, m, depth, VMIN, VMAX, cfg, ctx) {
+            Ok(v) => {
+                if v > best {
+                    best = v;
+                    ties.clear();
+                    ties.push(m);
+                } else if v == best {
+                    ties.push(m);
+                }
+            }
+            Err(()) => return vec![primary], // budget-out: keep the proven best
+        }
+    }
+    if ties.is_empty() { vec![primary] } else { ties }
+}
+
 /// Node-budgeted iterative deepening. Returns the best move (255,255 if none).
+/// Among moves the search rates EXACTLY equal-best, picks one via `rng_seed` (so ties
+/// vary game to game instead of always taking the first-ordered move). Exact-tie only,
+/// so this never prefers a worse move — zero strength cost. A fixed `rng_seed` is fully
+/// deterministic; the caller supplies a per-game/per-move seed for variety.
+/// `rng_seed == 0` is reserved as "off": legacy first-ordered behavior, unchanged.
 #[allow(clippy::too_many_arguments)]
 pub fn best_move(
     st: &State, node_budget: u64, contempt: f64, w_mob: f64, values: [f64; 8], max_depth: i32,
     db: Option<DbRef>, db_max: usize, dom_term: bool, rep_detect: bool, win_dist: bool,
-    rep_seed: &[u64],
+    rep_seed: &[u64], rng_seed: u64,
 ) -> (u8, u8) {
     let cfg = Cfg {
         w_mob, values, contempt, root: st.mover_color(),
@@ -896,14 +946,27 @@ pub fn best_move(
         killers: vec![[(255u8, 255u8); 2]; 128], history: [[0u32; NSQ]; NSQ] };
     let mut best = mv[0];
     let mut hint = None;
+    let mut last_depth = 0;
     for depth in 1..=max_depth {
         match best_at_depth(st, depth, &cfg, &mut ctx, hint) {
             Ok((Some(m), _)) => {
                 best = m;
                 hint = Some(m);
+                last_depth = depth;
             }
             _ => break, // budget exceeded (or no move)
         }
     }
-    best
+    if rng_seed == 0 || last_depth == 0 {
+        // rng_seed==0 is the reserved "off" value: legacy deterministic behavior
+        // (first-ordered best). last_depth==0 means depth 1 never completed.
+        return best;
+    }
+    // Break exact ties among equal-best root moves. `best` is always in the tie set.
+    let ties = root_ties_at_depth(st, last_depth, &cfg, &mut ctx, Some(best), best);
+    if ties.len() <= 1 {
+        return best;
+    }
+    let idx = (splitmix64(rng_seed) % ties.len() as u64) as usize;
+    ties[idx]
 }

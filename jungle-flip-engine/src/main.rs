@@ -380,6 +380,18 @@ fn search_best(
     db_max: usize,
 ) -> String {
     let st = state_of(p);
+    // Tie-break seed: exact-value ties among root moves resolve randomly instead of
+    // always taking the first-ordered move (e.g. the opening flip, where all 16 tiles
+    // are equal). `JF_TIE_SEED` unset/0 keeps legacy deterministic play (golden tests);
+    // the server sets a per-game value, mixed with the position key so each position
+    // varies independently.
+    let base_seed = std::env::var("JF_TIE_SEED").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let rng_seed = if base_seed == 0 {
+        0
+    } else {
+        let mixed = base_seed ^ st.rep_key();
+        if mixed == 0 { base_seed } else { mixed }
+    };
     let (frm, to) = engine::best_move(
         &st,
         node_budget,
@@ -393,6 +405,7 @@ fn search_best(
         REP_DETECT,
         WIN_DIST,
         rep_seed,
+        rng_seed,
     );
     if frm == 255 {
         "(none)".to_string()
@@ -499,6 +512,35 @@ mod fen_tests {
         assert_eq!(p.bag.iter().sum::<u32>(), 16);
         assert_eq!(down(&p), 16);
         assert_eq!(fen_from_state(&p), fen);
+    }
+
+    #[test]
+    fn opening_tie_break_off_by_default_varies_with_seed() {
+        // Every opening flip is an exact-value tie. rng_seed==0 (default; JF_TIE_SEED unset)
+        // must keep legacy deterministic play: the first-ordered move, square 0. Nonzero seeds
+        // must spread across tiles, and every pick must be a legal flip (from==to on a face-down
+        // square) so tie-breaking never fabricates a move.
+        let pool = "R1C1D1W1P1T1L1E1r1c1d1w1p1t1l1e1";
+        let fen = format!("XXXX/XXXX/XXXX/XXXX - {pool} 0 0");
+        let st = state_of(&state_from_fen(&fen).expect("parse"));
+        let pick = |seed: u64| {
+            engine::best_move(
+                &st, 512_000, CONTEMPT, W_MOB, DEFAULT_VALUES, MAX_DEPTH,
+                None, 0, DOM_TERM, REP_DETECT, WIN_DIST, &[], seed,
+            )
+        };
+        // default seed 0 is deterministic and legacy: square 0, repeatably.
+        assert_eq!(pick(0), (0, 0));
+        assert_eq!(pick(0), (0, 0));
+        // nonzero seeds vary and stay legal flips.
+        let mut seen = std::collections::HashSet::new();
+        for seed in 1..=64u64 {
+            let (f, t) = pick(seed);
+            assert_eq!(f, t, "tie-break must return a flip (from==to)");
+            assert_eq!(st.sq[f as usize], engine::DOWN, "flip must target a face-down tile");
+            seen.insert(f);
+        }
+        assert!(seen.len() >= 2, "nonzero seeds should produce variety, got {seen:?}");
     }
 
     #[test]

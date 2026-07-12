@@ -220,18 +220,19 @@ mod pyext {
     #[pyfunction]
     #[pyo3(signature = (squares, bag, first_color, ply, no_progress, node_budget, contempt,
                         w_mob, values, max_depth, db_max, dom_term, rep_detect,
-                        win_dist=false, db_flat=false))]
+                        win_dist=false, db_flat=false, rng_seed=0))]
     #[allow(clippy::too_many_arguments)]
     fn engine_best_move(
         squares: Vec<i16>, bag: Vec<u32>, first_color: i16, ply: u32, no_progress: u32,
         node_budget: u64, contempt: f64, w_mob: f64, values: Vec<f64>, max_depth: i32,
         db_max: usize, dom_term: bool, rep_detect: bool, win_dist: bool, db_flat: bool,
+        rng_seed: u64,
     ) -> (u8, u8) {
         let st = mk_masked(squares, bag, first_color, ply, no_progress);
         let map_guard = DB.lock().unwrap();
         let flat_guard = FLAT.lock().unwrap();
         let db = db_ref(db_max, db_flat, &map_guard, &flat_guard);
-        engine::best_move(&st, node_budget, contempt, w_mob, vals8(values), max_depth, db, db_max, dom_term, rep_detect, win_dist, &[])
+        engine::best_move(&st, node_budget, contempt, w_mob, vals8(values), max_depth, db, db_max, dom_term, rep_detect, win_dist, &[], rng_seed)
     }
 
     /// Root search VALUE (stm-perspective, in (-1,1)) at the deepest depth under the budget.
