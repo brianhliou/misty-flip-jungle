@@ -87,7 +87,7 @@ mod engine;
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 
-const ENGINE_NAME: &str = "MistyJungleFlip 0.4.0";
+const ENGINE_NAME: &str = "MistyJungleFlip 0.5.0";
 const DEFAULT_MOVETIME_MS: u64 = 1000;
 const DEFAULT_NODES: u64 = 512_000;
 /// Derived node ceiling per millisecond of `movetime` (the search has no in-line wall

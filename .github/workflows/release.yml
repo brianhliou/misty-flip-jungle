@@ -29,8 +29,10 @@ jobs:
           sha256sum dist/jungle-flip-engine | awk '{print $1}' > dist/jungle-flip-engine.sha256
           sha256sum dist/jungle_flip_tb_4.bin | awk '{print $1}' > dist/jungle_flip_tb_4.bin.sha256
           printf 'uci\nquit\n' | ./dist/jungle-flip-engine | head -3
-          # the binary must pick the artifact up when it sits next to the executable
-          printf 'position fen 3E/1r2/3t/4 b - 0 47\ngo nodes 512000\nquit\n' | ./dist/jungle-flip-engine | grep -x 'bestmove b2c2'
+          # the binary must pick the artifact up when it sits next to the executable.
+          # JF_TIE_SEED=0 pins the deterministic (legacy) move so the random tie-break
+          # among exactly-equal moves can't flake this golden assertion.
+          printf 'position fen 3E/1r2/3t/4 b - 0 47\ngo nodes 512000\nquit\n' | JF_TIE_SEED=0 ./dist/jungle-flip-engine | grep -x 'bestmove b2c2'
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
