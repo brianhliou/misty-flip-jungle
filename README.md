@@ -49,7 +49,8 @@ It solves every position up to `<max_pieces>` by parallel retrograde analysis an
 table (two result bits plus one distance byte per position). The UCI engine loads a prebuilt table
 from `$JUNGLE_FLIP_TB` or `jungle_flip_tb_4.bin` beside the binary (a ≤4 table ships as a release
 asset), and builds the ≤2 table at startup if none is found. Strength is a node budget, so results
-reproduce across machines.
+reproduce across machines (aside from the randomized tie-break among exactly-equal moves; see
+[Determinism and opening variety](#determinism-and-opening-variety)).
 
 Python bindings (`jungle_flip_rust`: search, move generation, tablebase queries) build with
 [maturin](https://github.com/PyO3/maturin):
@@ -57,6 +58,22 @@ Python bindings (`jungle_flip_rust`: search, move generation, tablebase queries)
 ```bash
 maturin develop --release
 ```
+
+## Determinism and opening variety
+
+Every position with a unique best move is deterministic: strength is a node budget, so
+tactics and endgames reproduce across machines. Positions the search rates *exactly* equal —
+most visibly the opening flip, where all 16 face-down tiles are identical by symmetry — are
+settled by a random tie-break, so the engine does not play the same opening every game.
+Because it fires only among moves of exactly equal value, it never costs strength.
+
+By default the UCI binary seeds this from fresh per-search entropy, so openings vary out of
+the box. Set `JF_TIE_SEED` to pin it:
+
+- `JF_TIE_SEED=0` — fully deterministic (always the first tied move); use for exact replay,
+  debugging, and reproducible self-play.
+- `JF_TIE_SEED=<nonzero>` — reproducible variety: the same seed always yields the same game, a
+  different seed a different one. Generate and log one per game to get variety and exact replay.
 
 ## Layout
 

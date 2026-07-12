@@ -59,6 +59,14 @@
 //! as a derived node-budget ceiling (the existing search exposes only a node budget, not
 //! an in-search wall-clock check); whichever bound is tighter wins, mirroring banqi's
 //! "honor both" semantics.
+//!
+//! Environment:
+//!   JF_TIE_SEED  Seeds the tie-break among exactly-equal-value root moves (e.g. the
+//!                opening flip, where all 16 tiles are equal by symmetry). Unset -> fresh
+//!                per-search entropy, so openings vary. Set to 0 for legacy deterministic
+//!                play, or a nonzero value for reproducible variety (same seed -> same
+//!                game). Only tied choices are affected; unique best moves stay
+//!                deterministic, so `nodes`-budget reproducibility is otherwise intact.
 
 #[path = "../../jungle_flip_rust/src/game.rs"]
 #[allow(dead_code)] // game.rs exposes the full revealed-board model; only EMPTY/NSQ are reached here
