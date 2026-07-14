@@ -51,7 +51,8 @@
 //!                                       "moves ..." token, if any, is ignored: the
 //!                                       no-progress clock + masked state are carried in
 //!                                       the FEN itself)
-//!   go [movetime <ms>] [nodes <n>]   -> search, emit "bestmove <uci>" (or "(none)")
+//!   go [movetime <ms>] [nodes <n>]   -> search, emit "info … score cp <n> pv <uci>" then
+//!                                       "bestmove <uci>" (or "bestmove (none)")
 //!   quit                             -> exit
 //!
 //! `nodes` is the AUTHORITATIVE strength knob and reproduces the Python engine's
@@ -87,7 +88,7 @@ mod engine;
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 
-const ENGINE_NAME: &str = "MistyJungleFlip 0.5.0";
+const ENGINE_NAME: &str = "MistyJungleFlip 0.5.1";
 const DEFAULT_MOVETIME_MS: u64 = 1000;
 const DEFAULT_NODES: u64 = 512_000;
 /// Derived node ceiling per millisecond of `movetime` (the search has no in-line wall
@@ -401,7 +402,7 @@ fn search_best(
     db: Option<engine::DbRef>,
     db_max: usize,
     base_seed: u64,
-) -> String {
+) -> (String, i64) {
     let st = state_of(p);
     // Tie-break: exact-value ties among root moves (e.g. the opening flip, where all 16
     // tiles are equal) resolve via `base_seed` instead of always taking the first-ordered
@@ -414,7 +415,7 @@ fn search_best(
         let mixed = base_seed ^ st.rep_key();
         if mixed == 0 { base_seed } else { mixed }
     };
-    let (frm, to) = engine::best_move(
+    let ((frm, to), score) = engine::best_move_scored(
         &st,
         node_budget,
         CONTEMPT,
@@ -430,9 +431,12 @@ fn search_best(
         rng_seed,
     );
     if frm == 255 {
-        "(none)".to_string()
+        ("(none)".to_string(), 0)
     } else {
-        move_to_uci((frm, to))
+        // Root value is side-to-move win-ness in ~[-1, 1]; ×1000 maps it onto the platform's
+        // centipawn win% curve (±1 ≈ decisive ≈ ±1000 cp). Clamp guards any terminal sentinel.
+        let cp = (score.clamp(-1.0, 1.0) * 1000.0).round() as i64;
+        (move_to_uci((frm, to)), cp)
     }
 }
 
@@ -500,11 +504,20 @@ fn main() {
                 if movetime.is_some() || nodes.is_none() {
                     budget = budget.min(mt.saturating_mul(NODES_PER_MS).max(1));
                 }
-                let mv = match &current {
-                    Some(p) => search_best(p, budget, &current_reps, db.as_ref().map(LeafDb::as_ref), db_max, tie_base_seed()),
-                    None => "(none)".to_string(),
-                };
-                println!("bestmove {mv}");
+                match &current {
+                    Some(p) => {
+                        let (uci, cp) = search_best(p, budget, &current_reps, db.as_ref().map(LeafDb::as_ref), db_max, tie_base_seed());
+                        if uci == "(none)" {
+                            println!("bestmove (none)");
+                        } else {
+                            // `info … score cp` is what whole-game analysis reads; bestmove
+                            // alone drives PvE play. Emit both.
+                            println!("info score cp {cp} pv {uci}");
+                            println!("bestmove {uci}");
+                        }
+                    }
+                    None => println!("bestmove (none)"),
+                }
             }
             "quit" => break,
             _ => {}
@@ -640,18 +653,18 @@ mod fen_tests {
         let p = state_from_fen(root).expect("root");
 
         // History-blind (legacy): the engine plays the shuffle, blind to the repetition.
-        let blind = search_best(&p, 512_000, &[], None, 0, 0);
+        let blind = search_best(&p, 512_000, &[], None, 0, 0).0;
         assert_eq!(blind, "a0a1", "without a rep seed the engine repeats");
 
         // Seed Q as already-seen: a0a1 now scores as a draw, so the engine must deviate.
         let seed = parse_rep_seed(q);
-        let aware = search_best(&p, 512_000, &seed, None, 0, 0);
+        let aware = search_best(&p, 512_000, &seed, None, 0, 0).0;
         assert_ne!(aware, "a0a1", "with the rep seed the engine avoids the threefold move");
 
         // A valid but unrelated seed must not perturb the move (no false positives).
         let unrelated = parse_rep_seed("L3/4/4/l3 b - 0 5");
         assert!(!unrelated.is_empty(), "control seed must actually parse");
-        assert_eq!(search_best(&p, 512_000, &unrelated, None, 0, 0), "a0a1");
+        assert_eq!(search_best(&p, 512_000, &unrelated, None, 0, 0).0, "a0a1");
     }
 
     #[test]
@@ -662,13 +675,13 @@ mod fen_tests {
         let p = state_from_fen("4/4/l3/L3 r - 1 60").expect("two-lion endgame");
 
         // db=None (the shipped v0.2.0 behaviour): contempt makes the engine flee the trade.
-        let fled = search_best(&p, 512_000, &[], None, 0, 0);
+        let fled = search_best(&p, 512_000, &[], None, 0, 0).0;
         assert_ne!(fled, "a0a1", "without the DB leaf the engine flees the trade");
 
         // ≤2 exact tablebase leaf: the dead draw is recognised, all moves tie, and move
         // ordering takes the trade — securing the draw immediately.
         let db = endgame::build(2).0;
-        let secured = search_best(&p, 512_000, &[], Some(engine::DbRef::Map(&db)), 2, 0);
+        let secured = search_best(&p, 512_000, &[], Some(engine::DbRef::Map(&db)), 2, 0).0;
         assert_eq!(secured, "a0a1", "the DB leaf makes the engine take the drawn trade");
     }
 
@@ -682,7 +695,7 @@ mod fen_tests {
         let p = state_from_fen("3E/1r2/3t/4 b - 0 47").expect("won 3-piece endgame");
         let db = endgame::build(2).0;
         assert_eq!(
-            search_best(&p, 512_000, &[], Some(engine::DbRef::Map(&db)), 2, 0),
+            search_best(&p, 512_000, &[], Some(engine::DbRef::Map(&db)), 2, 0).0,
             "b2c2",
             "distance-aware scoring takes the shortest forced win"
         );
