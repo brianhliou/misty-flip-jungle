@@ -990,3 +990,300 @@ pub fn best_move_scored(
     let idx = (splitmix64(rng_seed) % ties.len() as u64) as usize;
     (ties[idx], best_score)
 }
+
+// ============================================================================
+// Redacted-FEN parsing + UCI-coord helpers + per-root-move values.
+//
+// The FEN cluster moved here from the UCI binary (`jungle-flip-engine/src/main.rs`) so the
+// wasm client build and the UCI binary share ONE parser: the in-browser client engine and
+// the server engine must build byte-identical masked states from the same redacted FEN.
+// `root_move_values` is the per-move MultiPV the browser analysis panel renders (the UCI
+// binary only ever needs `best_move`).
+// ============================================================================
+
+// Index 0..7 = rat,cat,dog,wolf,leopard,tiger,lion,elephant (role IS rank-1).
+pub const ROLE_LETTERS: [u8; 8] = [b'R', b'C', b'D', b'W', b'P', b'T', b'L', b'E'];
+
+/// Role char (case-insensitive) -> masked code `color*8 + role`. UPPER=red(0), lower=black(1).
+pub fn letter_to_code(ch: u8) -> Option<i16> {
+    let upper = ch.to_ascii_uppercase();
+    let role = ROLE_LETTERS.iter().position(|&c| c == upper)? as i16;
+    let color = if ch.is_ascii_uppercase() { 0 } else { 1 };
+    Some(color * 8 + role)
+}
+
+/// Masked code `color*8 + role` -> role char (UPPER red / lower black).
+#[allow(dead_code)]
+pub fn code_to_letter(code: i16) -> u8 {
+    let l = ROLE_LETTERS[(code % 8) as usize];
+    if code / 8 == 0 {
+        l
+    } else {
+        l.to_ascii_lowercase()
+    }
+}
+
+/// Square index (0..15) -> UCI token "<file><rankdigit>" (file a..d, rankdigit 0..3).
+pub fn square_to_uci(i: usize) -> String {
+    let file = (b'a' + (i % 4) as u8) as char;
+    let rank = (b'0' + (i / 4) as u8) as char;
+    format!("{file}{rank}")
+}
+
+#[allow(dead_code)]
+pub fn uci_to_square(s: &[u8]) -> Option<u8> {
+    if s.len() != 2 {
+        return None;
+    }
+    let file = s[0].to_ascii_lowercase().checked_sub(b'a')?;
+    let rank = s[1].checked_sub(b'0')?;
+    if file >= 4 || rank >= 4 {
+        return None;
+    }
+    Some(file + rank * 4)
+}
+
+/// (from, to) -> UCI; a FLIP is from==to (e.g. "a0a0").
+pub fn move_to_uci(m: (u8, u8)) -> String {
+    format!("{}{}", square_to_uci(m.0 as usize), square_to_uci(m.1 as usize))
+}
+
+/// Parsed redacted position for the search. `first_color`/`ply` are reconstructed from the
+/// FEN's `turn` + `movenum` so the masked state is bit-identical to the Python serialization.
+pub struct Parsed {
+    pub squares: [i16; 16],
+    pub bag: [u32; 16],
+    pub first_color: i16,
+    pub ply: u32,
+    pub no_progress: u32,
+}
+
+/// Parse a redacted Flip Jungle FEN. Returns None on any malformed field OR if the pool count
+/// disagrees with the on-board face-down count (a fail-closed encoding-bug guard).
+pub fn state_from_fen(fen: &str) -> Option<Parsed> {
+    let parts: Vec<&str> = fen.split_whitespace().collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    let ranks: Vec<&str> = parts[0].split('/').collect();
+    if ranks.len() != 4 {
+        return None;
+    }
+    let mut squares = [EMPTY; 16];
+    let mut down_count = 0u32;
+    for (i, rank_str) in ranks.iter().enumerate() {
+        let rank = 4 - i; // parts[0] is rank 4 (top)
+        let mut file = 0usize;
+        for ch in rank_str.bytes() {
+            if file >= 4 {
+                return None;
+            }
+            let idx = file + (rank - 1) * 4;
+            if ch.is_ascii_digit() {
+                file += (ch - b'0') as usize;
+                continue;
+            } else if ch == b'X' {
+                squares[idx] = DOWN;
+                down_count += 1;
+            } else {
+                squares[idx] = letter_to_code(ch)?;
+            }
+            file += 1;
+        }
+        if file != 4 {
+            return None;
+        }
+    }
+    let mover: i16 = match parts[1] {
+        "r" => 0,
+        "b" => 1,
+        "-" => -1,
+        _ => return None,
+    };
+    let mut bag = [0u32; 16];
+    if parts[2] != "-" {
+        let bytes = parts[2].as_bytes();
+        let mut j = 0;
+        while j < bytes.len() {
+            let code = letter_to_code(bytes[j])? as usize;
+            j += 1;
+            let mut n = 0u32;
+            let mut saw_digit = false;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                n = n * 10 + (bytes[j] - b'0') as u32;
+                j += 1;
+                saw_digit = true;
+            }
+            if !saw_digit {
+                return None;
+            }
+            bag[code] = n;
+        }
+    }
+    if bag.iter().sum::<u32>() != down_count {
+        return None;
+    }
+    let no_progress: u32 = parts[3].parse().ok()?;
+    let ply: u32 = if parts.len() >= 5 { parts[4].parse().ok()? } else { 0 };
+    let first_color: i16 = if mover < 0 {
+        -1
+    } else if ply % 2 == 0 {
+        mover
+    } else {
+        1 - mover
+    };
+    Some(Parsed { squares, bag, first_color, ply, no_progress })
+}
+
+/// Re-encode a masked state to a redacted FEN (round-trip helper for tests + fen_vectors).
+/// Mirrors `state_from_fen` exactly.
+#[allow(dead_code)]
+pub fn fen_from_state(p: &Parsed) -> String {
+    let mut board = String::new();
+    for i in 0..4usize {
+        let rank = 4 - i;
+        let mut empties = 0;
+        for file in 0..4usize {
+            let c = p.squares[file + (rank - 1) * 4];
+            if c == EMPTY {
+                empties += 1;
+                continue;
+            }
+            if empties > 0 {
+                board.push_str(&empties.to_string());
+                empties = 0;
+            }
+            if c == DOWN {
+                board.push('X');
+            } else {
+                board.push(code_to_letter(c) as char);
+            }
+        }
+        if empties > 0 {
+            board.push_str(&empties.to_string());
+        }
+        if i + 1 < 4 {
+            board.push('/');
+        }
+    }
+    let mover = if p.first_color < 0 {
+        -1
+    } else if p.ply % 2 == 0 {
+        p.first_color
+    } else {
+        1 - p.first_color
+    };
+    let turn = match mover {
+        0 => "r",
+        1 => "b",
+        _ => "-",
+    };
+    let mut pool = String::new();
+    for code in 0..16usize {
+        if p.bag[code] > 0 {
+            pool.push(code_to_letter(code as i16) as char);
+            pool.push_str(&p.bag[code].to_string());
+        }
+    }
+    if pool.is_empty() {
+        pool.push('-');
+    }
+    format!("{board} {turn} {pool} {} {}", p.no_progress, p.ply)
+}
+
+/// Parsed redacted position -> masked search State.
+pub fn state_of(p: &Parsed) -> State {
+    State {
+        sq: p.squares,
+        bag: p.bag,
+        first_color: p.first_color,
+        ply: p.ply,
+        no_progress: p.no_progress,
+    }
+}
+
+/// Every legal root move's EXACT value (side-to-move perspective) at the deepest depth
+/// completed within `node_budget`, searched with a FULL window per move (no alpha narrowing
+/// across siblings, so each move gets a true value rather than an alpha-beta bound). This is
+/// the per-move MultiPV the in-browser client panel renders; the UCI binary uses `best_move`
+/// and never needs it. Returns (from, to, value, depth_reached), sorted best-first.
+#[allow(clippy::too_many_arguments)]
+pub fn root_move_values(
+    st: &State,
+    node_budget: u64,
+    contempt: f64,
+    w_mob: f64,
+    values: [f64; 8],
+    max_depth: i32,
+    db: Option<DbRef>,
+    db_max: usize,
+    dom_term: bool,
+    rep_detect: bool,
+    win_dist: bool,
+    rep_seed: &[u64],
+) -> Vec<(u8, u8, f64, i32)> {
+    let cfg = Cfg {
+        w_mob,
+        values,
+        contempt,
+        root: st.mover_color(),
+        quiesce: true,
+        quiesce_max: 8,
+        db,
+        db_max,
+        dom_term,
+        rep_detect,
+        win_dist,
+        root_ply: st.ply,
+        rep_seed,
+        order_heur: true,
+    };
+    let mut roots: Vec<(u8, u8)> = Vec::new();
+    st.legal_moves(&mut roots);
+    if roots.is_empty() {
+        return Vec::new();
+    }
+    let mut ctx = Ctx {
+        nodes: 0,
+        budget: node_budget,
+        tt: std::collections::HashMap::new(),
+        path: Vec::new(),
+        killers: vec![[(255u8, 255u8); 2]; 128],
+        history: [[0u32; NSQ]; NSQ],
+    };
+    let mut completed: Vec<(u8, u8, f64)> = Vec::new();
+    let mut depth_reached = 0;
+    let mut hint: Option<(u8, u8)> = None;
+    for depth in 1..=max_depth {
+        let kdi = (depth as usize).min(ctx.killers.len() - 1);
+        let killers_d = ctx.killers[kdi];
+        let moves = ordered_moves(st, &cfg.values, hint, &killers_d, &ctx.history);
+        if cfg.rep_detect {
+            ctx.path.clear();
+            ctx.path.push(st.rep_key());
+            ctx.path.extend_from_slice(cfg.rep_seed);
+        }
+        let mut this: Vec<(u8, u8, f64)> = Vec::with_capacity(moves.len());
+        let mut aborted = false;
+        for m in moves {
+            match move_value(st, m, depth, VMIN, VMAX, &cfg, &mut ctx) {
+                Ok(v) => this.push((m.0, m.1, v)),
+                Err(()) => {
+                    aborted = true;
+                    break;
+                }
+            }
+        }
+        if aborted {
+            break;
+        }
+        this.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        hint = this.first().map(|&(f, t, _)| (f, t));
+        completed = this;
+        depth_reached = depth;
+    }
+    completed
+        .into_iter()
+        .map(|(f, t, v)| (f, t, v, depth_reached))
+        .collect()
+}
