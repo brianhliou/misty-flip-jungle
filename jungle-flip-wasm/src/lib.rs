@@ -38,6 +38,23 @@ const DOM_TERM: bool = false;
 const REP_DETECT: bool = true;
 const WIN_DIST: bool = true;
 
+fn analysis_json(ranked: &[(u8, u8, f64, i32)], multipv: u32, nodes: u64) -> String {
+    let take = (multipv.max(1) as usize).min(ranked.len());
+    let mut out = format!("{{\"nodes\":{nodes},\"lines\":[");
+    for (i, &(from, to, value, depth)) in ranked.iter().take(take).enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let uci = engine::move_to_uci((from, to));
+        // Root value is side-to-move win-ness in ~[-1, 1]; ×1000 maps onto the platform's
+        // centipawn win% curve (±1 ≈ decisive ≈ ±1000 cp), same as the UCI binary.
+        let cp = (value.clamp(-1.0, 1.0) * 1000.0).round() as i64;
+        out.push_str(&format!("{{\"uci\":\"{uci}\",\"cp\":{cp},\"depth\":{depth}}}"));
+    }
+    out.push_str("]}");
+    out
+}
+
 /// Evaluate a redacted Flip Jungle FEN and return the top-`multipv` legal moves as JSON,
 /// ranked best-first, each with an exact side-to-move centipawn score.
 ///
@@ -51,33 +68,61 @@ pub fn analyze(fen: &str, nodes: u32, multipv: u32) -> String {
         None => return "{\"error\":\"bad_fen\"}".to_string(),
     };
     let st = engine::state_of(&parsed);
-    let ranked = engine::root_move_values(
-        &st,
-        nodes as u64,
+    let mut session = engine::RootAnalysisSession::new(
+        st,
         CONTEMPT,
         W_MOB,
         DEFAULT_VALUES,
         MAX_DEPTH,
-        None, // no tablebase in the browser
-        0,
         DOM_TERM,
         REP_DETECT,
         WIN_DIST,
         &[], // no repetition seed for a single-position analysis
     );
-    // ranked: Vec<(from, to, value, depth_reached)>, already sorted descending by value.
-    let take = (multipv.max(1) as usize).min(ranked.len());
-    let mut out = String::from("{\"lines\":[");
-    for (i, &(from, to, value, depth)) in ranked.iter().take(take).enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        let uci = engine::move_to_uci((from, to));
-        // Root value is side-to-move win-ness in ~[-1, 1]; ×1000 maps onto the platform's
-        // centipawn win% curve (±1 ≈ decisive ≈ ±1000 cp), same as the UCI binary.
-        let cp = (value.clamp(-1.0, 1.0) * 1000.0).round() as i64;
-        out.push_str(&format!("{{\"uci\":\"{uci}\",\"cp\":{cp},\"depth\":{depth}}}"));
+    let ranked = session.advance(nodes as u64);
+    analysis_json(&ranked, multipv, nodes as u64)
+}
+
+/// Stateful, incrementally advanced analysis for the browser's continuous mode.
+///
+/// JavaScript calls `step` with bounded node slices and yields to the worker event loop
+/// between calls. Dropping this object cancels the search without an unbounded wasm call.
+#[wasm_bindgen]
+pub struct AnalysisSession {
+    inner: engine::RootAnalysisSession,
+    multipv: u32,
+}
+
+#[wasm_bindgen]
+impl AnalysisSession {
+    #[wasm_bindgen(constructor)]
+    pub fn new(fen: &str, multipv: u32) -> Result<AnalysisSession, JsValue> {
+        let parsed =
+            engine::state_from_fen(fen).ok_or_else(|| JsValue::from_str("bad_fen"))?;
+        let st = engine::state_of(&parsed);
+        Ok(Self {
+            inner: engine::RootAnalysisSession::new(
+                st,
+                CONTEMPT,
+                W_MOB,
+                DEFAULT_VALUES,
+                MAX_DEPTH,
+                DOM_TERM,
+                REP_DETECT,
+                WIN_DIST,
+                &[],
+            ),
+            multipv: multipv.max(1),
+        })
     }
-    out.push_str("]}");
-    out
+
+    pub fn step(&mut self, nodes: u32) -> String {
+        let ranked = self.inner.advance(nodes as u64);
+        analysis_json(&ranked, self.multipv, self.inner.total_nodes())
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn depth(&self) -> i32 {
+        self.inner.depth()
+    }
 }
