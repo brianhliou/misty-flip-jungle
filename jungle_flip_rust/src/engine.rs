@@ -1287,3 +1287,234 @@ pub fn root_move_values(
         .map(|(f, t, v)| (f, t, v, depth_reached))
         .collect()
 }
+
+/// Incremental root analysis for the browser engine.
+///
+/// Each call to [`advance`] gets a bounded node slice, while the transposition table,
+/// killer/history ordering, and any useful entries from an interrupted depth survive into
+/// the next slice. This gives the wasm worker a cooperative cancellation boundary without
+/// throwing away the search every time it yields to the browser event loop.
+///
+/// The session deliberately has no tablebase reference. The wasm build does not ship the
+/// native tablebase, and keeping this type lifetime-free lets wasm-bindgen own it directly.
+pub struct RootAnalysisSession {
+    st: State,
+    contempt: f64,
+    w_mob: f64,
+    values: [f64; 8],
+    max_depth: i32,
+    dom_term: bool,
+    rep_detect: bool,
+    win_dist: bool,
+    rep_seed: Vec<u64>,
+    ctx: Ctx,
+    completed: Vec<(u8, u8, f64)>,
+    depth_reached: i32,
+    hint: Option<(u8, u8)>,
+    total_nodes: u64,
+}
+
+impl RootAnalysisSession {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        st: State,
+        contempt: f64,
+        w_mob: f64,
+        values: [f64; 8],
+        max_depth: i32,
+        dom_term: bool,
+        rep_detect: bool,
+        win_dist: bool,
+        rep_seed: &[u64],
+    ) -> Self {
+        Self {
+            st,
+            contempt,
+            w_mob,
+            values,
+            max_depth,
+            dom_term,
+            rep_detect,
+            win_dist,
+            rep_seed: rep_seed.to_vec(),
+            ctx: Ctx {
+                nodes: 0,
+                budget: 0,
+                tt: std::collections::HashMap::new(),
+                path: Vec::new(),
+                killers: vec![[(255u8, 255u8); 2]; 128],
+                history: [[0u32; NSQ]; NSQ],
+            },
+            completed: Vec::new(),
+            depth_reached: 0,
+            hint: None,
+            total_nodes: 0,
+        }
+    }
+
+    /// Continue iterative deepening for at most `node_budget` additional nodes.
+    ///
+    /// A budget-out discards only the incomplete depth. Its TT and ordering work remains
+    /// available to the next call, so repeated bounded slices make forward progress.
+    pub fn advance(&mut self, node_budget: u64) -> Vec<(u8, u8, f64, i32)> {
+        if self.depth_reached >= self.max_depth {
+            return self.results();
+        }
+
+        let cfg = Cfg {
+            w_mob: self.w_mob,
+            values: self.values,
+            contempt: self.contempt,
+            root: self.st.mover_color(),
+            quiesce: true,
+            quiesce_max: 8,
+            db: None,
+            db_max: 0,
+            dom_term: self.dom_term,
+            rep_detect: self.rep_detect,
+            win_dist: self.win_dist,
+            root_ply: self.st.ply,
+            rep_seed: &self.rep_seed,
+            order_heur: true,
+        };
+
+        self.ctx.nodes = 0;
+        self.ctx.budget = node_budget.max(1);
+        // A budget-out can leave ancestors on the path because `?` returns before their
+        // cleanup. The incomplete depth is discarded, so start the next slice cleanly.
+        self.ctx.path.clear();
+
+        for depth in (self.depth_reached + 1)..=self.max_depth {
+            let kdi = (depth as usize).min(self.ctx.killers.len() - 1);
+            let killers_d = self.ctx.killers[kdi];
+            let moves = ordered_moves(
+                &self.st,
+                &cfg.values,
+                self.hint,
+                &killers_d,
+                &self.ctx.history,
+            );
+            if cfg.rep_detect {
+                self.ctx.path.clear();
+                self.ctx.path.push(self.st.rep_key());
+                self.ctx.path.extend_from_slice(cfg.rep_seed);
+            }
+
+            // Evaluate only one representative from each root orbit under symmetries that
+            // preserve this exact position. At the all-covered opening this turns 16 root
+            // flips into the three real D4 classes: corner, edge, and centre.
+            let mut orbit_values: HashMap<(u8, u8), f64> = HashMap::new();
+            let mut this: Vec<(u8, u8, f64)> = Vec::with_capacity(moves.len());
+            let mut aborted = false;
+            for m in moves {
+                let orbit = root_orbit_key(&self.st, m);
+                let value = if let Some(&v) = orbit_values.get(&orbit) {
+                    v
+                } else {
+                    match move_value(&self.st, m, depth, VMIN, VMAX, &cfg, &mut self.ctx) {
+                        Ok(v) => {
+                            orbit_values.insert(orbit, v);
+                            v
+                        }
+                        Err(()) => {
+                            aborted = true;
+                            break;
+                        }
+                    }
+                };
+                this.push((m.0, m.1, value));
+            }
+            if aborted {
+                break;
+            }
+            this.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            self.hint = this.first().map(|&(f, t, _)| (f, t));
+            self.completed = this;
+            self.depth_reached = depth;
+        }
+
+        self.total_nodes = self
+            .total_nodes
+            .saturating_add(self.ctx.nodes.min(self.ctx.budget));
+        self.results()
+    }
+
+    pub fn depth(&self) -> i32 {
+        self.depth_reached
+    }
+
+    pub fn total_nodes(&self) -> u64 {
+        self.total_nodes
+    }
+
+    fn results(&self) -> Vec<(u8, u8, f64, i32)> {
+        self.completed
+            .iter()
+            .map(|&(f, t, v)| (f, t, v, self.depth_reached))
+            .collect()
+    }
+}
+
+/// Canonical root-move representative under every D4 transform that leaves the complete
+/// masked state unchanged. Bag, turn, clocks, and colour binding are unaffected by a board
+/// transform, so board equality is the only stabilizer test required.
+fn root_orbit_key(st: &State, m: (u8, u8)) -> (u8, u8) {
+    let mut best = m;
+    for perm in &crate::game::D4 {
+        let preserves = (0..NSQ).all(|i| st.sq[perm[i]] == st.sq[i]);
+        if !preserves {
+            continue;
+        }
+        let transformed = (perm[m.0 as usize] as u8, perm[m.1 as usize] as u8);
+        if transformed < best {
+            best = transformed;
+        }
+    }
+    best
+}
+
+#[cfg(test)]
+mod incremental_analysis_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    const OPENING_FEN: &str =
+        "XXXX/XXXX/XXXX/XXXX - R1C1D1W1P1T1L1E1r1c1d1w1p1t1l1e1 0 1";
+    const VALUES: [f64; 8] = [6.0, 2.0, 3.0, 4.0, 5.0, 7.0, 8.0, 10.0];
+
+    fn opening() -> State {
+        state_of(&state_from_fen(OPENING_FEN).expect("valid opening FEN"))
+    }
+
+    #[test]
+    fn opening_roots_collapse_to_three_d4_orbits() {
+        let st = opening();
+        let mut moves = Vec::new();
+        st.legal_moves(&mut moves);
+        let orbits: HashSet<(u8, u8)> =
+            moves.into_iter().map(|m| root_orbit_key(&st, m)).collect();
+        assert_eq!(orbits.len(), 3, "corner, edge, and centre");
+    }
+
+    #[test]
+    fn bounded_slices_reuse_search_and_advance_depth() {
+        let mut session = RootAnalysisSession::new(
+            opening(),
+            0.05,
+            0.8,
+            VALUES,
+            24,
+            false,
+            true,
+            true,
+            &[],
+        );
+        let mut results = Vec::new();
+        for _ in 0..3 {
+            results = session.advance(2_000_000);
+        }
+        assert!(session.depth() >= 3);
+        assert_eq!(results.len(), 16);
+        assert_eq!(session.total_nodes(), 6_000_000);
+    }
+}

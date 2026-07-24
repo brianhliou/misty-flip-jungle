@@ -62,9 +62,10 @@ maturin develop --release
 ## Determinism and opening variety
 
 Every position with a unique best move is deterministic: strength is a node budget, so
-tactics and endgames reproduce across machines. Positions the search rates *exactly* equal —
-most visibly the opening flip, where all 16 face-down tiles are identical by symmetry — are
-settled by a random tie-break, so the engine does not play the same opening every game.
+tactics and endgames reproduce across machines. Positions the search rates *exactly* equal
+are settled by a random tie-break, so the engine does not play the same opening every game.
+At the untouched opening the 16 squares fall into three exact D4 symmetry classes (corner,
+edge, and centre); shallow searches currently rate those classes equally too.
 Because it fires only among moves of exactly equal value, it never costs strength.
 
 By default the UCI binary seeds this from fresh per-search entropy, so openings vary out of
@@ -85,6 +86,8 @@ the box. Set `JF_TIE_SEED` to pin it:
   - `src/bin/build_tb.rs`: the standalone, Python-free tablebase-builder binary.
   - `src/lib.rs`: the PyO3 bindings, behind the default `pyext` feature.
 - `jungle-flip-engine/`: the UCI binary, which `#[path]`-includes the engine core.
+- `jungle-flip-wasm/`: the browser build, including bounded incremental analysis that
+  retains its search state between worker-event-loop yields.
 
 ## License
 
