@@ -20,7 +20,7 @@ Hidden identities make each flip a chance event, so the search is expectiminimax
     <img src="assets/game.webp" alt="A full MistyFlipJungle self-play game, tiles flipping and animals trading off the board" width="360">
   </a>
   <br>
-  <sub><i>MistyFlipJungle self-play: both lions and both elephants trade off (同归于尽), and Black wins.</i></sub>
+  <sub><i>MistyFlipJungle against itself at full strength (512K nodes a move): the rats, lions, wolves and leopards all trade off in pairs (同归于尽), and Black clears the board.</i></sub>
 </p>
 
 **Play it** against the computer on
