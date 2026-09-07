@@ -51,15 +51,47 @@
 //!                                       "moves ..." token, if any, is ignored: the
 //!                                       no-progress clock + masked state are carried in
 //!                                       the FEN itself)
-//!   go [movetime <ms>] [nodes <n>]   -> search, emit "info … score cp <n> pv <uci>" then
-//!                                       "bestmove <uci>" (or "bestmove (none)")
+//!   go [movetime <ms>] [nodes <n>]   -> search, emit
+//!                                       "info depth <d> nodes <n> nps <x> time <ms> score cp
+//!                                        <n> pv <uci>" then "bestmove <uci>" (or
+//!                                       "bestmove (none)")
 //!   quit                             -> exit
 //!
-//! `nodes` is the AUTHORITATIVE strength knob and reproduces the Python engine's
-//! `node_budget` exactly (see fen_vectors.json + the golden test). `movetime` is honored
-//! as a derived node-budget ceiling (the existing search exposes only a node budget, not
-//! an in-search wall-clock check); whichever bound is tighter wins, mirroring banqi's
-//! "honor both" semantics.
+//! The `depth`/`nodes`/`nps`/`time` fields in front of the score are what the search CONSUMED,
+//! and they exist so the host's per-move decision artifact can compare consumption against the
+//! budget it granted. Without them wall time is the only signal, and wall time cannot tell "the
+//! search got slower" from "the host got slower" — a sibling engine measured the same binary on
+//! the same position at 2,227 ms under loadavg 14.9 and 3,587 ms under loadavg 86.3. `nodes` is
+//! therefore the real visited count, never the requested budget echoed back: a field that
+//! repeats its own input looks like measurement and answers nothing. `depth` is the last
+//! iterative-deepening iteration that COMPLETED, and is omitted (rather than reported as 0) when
+//! the search was cut short before finishing one; `nps` is omitted when elapsed rounds to 0 ms.
+//! Omitting a field we do not have beats inventing one.
+//!
+//! ── THE TWO SEARCH LIMITS ────────────────────────────────────────────────────────
+//! `nodes` and `movetime` are INDEPENDENT limits and both are honored: whichever is reached
+//! first ends the search.
+//!
+//!   go nodes N              work-bounded. No wall clock, so it is REPRODUCIBLE run to run
+//!                           and reproduces the Python engine's `node_budget` exactly (see
+//!                           fen_vectors.json + the golden test). `nodes` remains the
+//!                           authoritative strength knob.
+//!   go movetime X           time-bounded: the search samples a monotonic clock and stops
+//!                           within a node-sampling interval of X ms. No work limit is
+//!                           imposed, because the caller asked for a time-bounded search.
+//!                           NOT reproducible run to run, by construction.
+//!   go movetime X nodes N   both; the first limit reached wins.
+//!   go                      the default node budget, no wall clock.
+//!
+//! `movetime` used to be converted into a node ceiling via a `NODES_PER_MS = 1_000_000`
+//! constant — a claim of one billion nodes per second against a real 0.6M-8.2M, so the
+//! ceiling only bound below about half a millisecond and `movetime` was inert: `go movetime
+//! 300` and `go movetime 1200` searched the identical 512,001 nodes. The fix is not a better
+//! constant. Any fixed nodes-per-ms figure is an assumption about how fast the host is, and
+//! throughput here varies ~1.5x with host load and ~6x across position types, so it would be
+//! wrong in one direction or the other essentially always — too loose on a busy host (blows
+//! the deadline the caller is waiting on), too tight on a quiet one (wastes the budget).
+//! A clock read costs nothing amortized over a sampling interval and makes no such claim.
 //!
 //! Environment:
 //!   JF_TIE_SEED  Seeds the tie-break among exactly-equal-value root moves (e.g. the
@@ -87,14 +119,13 @@ mod engine;
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
+use std::time::{Duration, Instant};
 
-const ENGINE_NAME: &str = "MistyJungleFlip 0.5.1";
-const DEFAULT_MOVETIME_MS: u64 = 1000;
+const ENGINE_NAME: &str = "MistyJungleFlip 0.5.2";
+/// Node budget for a `go` that names neither limit. Deliberately NOT a time budget: a bare
+/// `go` is the reproducible path the golden vectors depend on, and a wall clock would make it
+/// host-dependent.
 const DEFAULT_NODES: u64 = 512_000;
-/// Derived node ceiling per millisecond of `movetime` (the search has no in-line wall
-/// clock). Generous: the 4×4 search runs millions of nodes/sec, so this only ever binds
-/// when the caller asks for a very short think; `nodes` otherwise dominates.
-const NODES_PER_MS: u64 = 1_000_000;
 
 // ── Engine knobs — pinned to RustJungleFlipStrategy's defaults so the binary reproduces
 // the Python engine's choice byte-for-byte (see strategy.py / search.py).
@@ -198,14 +229,61 @@ fn tie_base_seed() -> u64 {
         .max(1)
 }
 
+/// Build the standard UCI search-info line, in the standard field order, so a generic parser
+/// picks it up. Fields the search did not actually produce are omitted, never estimated.
+fn search_info_line(stats: &engine::SearchStats, elapsed_ms: u64, cp: i64, pv: &str) -> String {
+    let mut line = String::from("info");
+    if stats.depth > 0 {
+        line.push_str(&format!(" depth {}", stats.depth));
+    }
+    line.push_str(&format!(" nodes {}", stats.nodes));
+    if elapsed_ms > 0 {
+        line.push_str(&format!(" nps {}", stats.nodes.saturating_mul(1000) / elapsed_ms));
+    }
+    line.push_str(&format!(" time {elapsed_ms} score cp {cp} pv {pv}"));
+    line
+}
+
+/// Parse a `go` line into the two search limits: `(node_budget, movetime_ms)`.
+///
+/// They are independent, and both are honored by the search — whichever is reached first
+/// stops it. The one non-obvious rule is what an OMITTED `nodes` means, and it depends on
+/// whether a `movetime` came with it:
+///
+///   * `movetime` present -> no work limit (`u64::MAX`). The caller asked for a time-bounded
+///     search; quietly capping it at the 512k default is what let a "one billion nodes per
+///     second" conversion constant hide for so long, since the default cap bound first in
+///     every realistic case and the movetime never did.
+///   * `movetime` absent  -> `DEFAULT_NODES`, and no deadline at all. This is the reproducible
+///     path, and putting a wall clock on it would make a bare `go` host-dependent.
+///
+/// Unparseable or missing values fall back as if the token were absent (fail-open: a bad
+/// `go` line still searches rather than refusing to move).
+fn parse_go_limits(line: &str) -> (u64, Option<u64>) {
+    let mut movetime: Option<u64> = None;
+    let mut nodes: Option<u64> = None;
+    let mut t = line.split_whitespace().skip(1);
+    while let Some(k) = t.next() {
+        match k {
+            "movetime" => movetime = t.next().and_then(|v| v.parse().ok()),
+            "nodes" => nodes = t.next().and_then(|v| v.parse().ok()),
+            _ => {}
+        }
+    }
+    let budget = nodes.unwrap_or(if movetime.is_some() { u64::MAX } else { DEFAULT_NODES });
+    (budget, movetime)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn search_best(
     p: &Parsed,
     node_budget: u64,
+    deadline: Option<Instant>,
     rep_seed: &[u64],
     db: Option<engine::DbRef>,
     db_max: usize,
     base_seed: u64,
-) -> (String, i64) {
+) -> (String, i64, engine::SearchStats) {
     let st = state_of(p);
     // Tie-break: exact-value ties among root moves (e.g. the opening flip, where all 16
     // tiles are equal) resolve via `base_seed` instead of always taking the first-ordered
@@ -218,9 +296,10 @@ fn search_best(
         let mixed = base_seed ^ st.rep_key();
         if mixed == 0 { base_seed } else { mixed }
     };
-    let ((frm, to), score) = engine::best_move_scored(
+    let ((frm, to), score, stats) = engine::best_move_scored_stats(
         &st,
         node_budget,
+        deadline,
         CONTEMPT,
         W_MOB,
         DEFAULT_VALUES,
@@ -234,12 +313,12 @@ fn search_best(
         rng_seed,
     );
     if frm == 255 {
-        ("(none)".to_string(), 0)
+        ("(none)".to_string(), 0, stats)
     } else {
         // Root value is side-to-move win-ness in ~[-1, 1]; ×1000 maps it onto the platform's
         // centipawn win% curve (±1 ≈ decisive ≈ ±1000 cp). Clamp guards any terminal sentinel.
         let cp = (score.clamp(-1.0, 1.0) * 1000.0).round() as i64;
-        (move_to_uci((frm, to)), cp)
+        (move_to_uci((frm, to)), cp, stats)
     }
 }
 
@@ -291,31 +370,23 @@ fn main() {
                 }
             }
             "go" => {
-                let mut movetime: Option<u64> = None;
-                let mut nodes: Option<u64> = None;
-                let mut t = line.split_whitespace().skip(1);
-                while let Some(k) = t.next() {
-                    match k {
-                        "movetime" => movetime = t.next().and_then(|v| v.parse().ok()),
-                        "nodes" => nodes = t.next().and_then(|v| v.parse().ok()),
-                        _ => {}
-                    }
-                }
-                // `nodes` is authoritative; `movetime` only tightens the ceiling.
-                let mut budget = nodes.unwrap_or(DEFAULT_NODES);
-                let mt = movetime.unwrap_or(DEFAULT_MOVETIME_MS);
-                if movetime.is_some() || nodes.is_none() {
-                    budget = budget.min(mt.saturating_mul(NODES_PER_MS).max(1));
-                }
+                // The clock starts when the `go` arrives, not after parsing: the caller's
+                // movetime covers everything it is waiting on.
+                let started = Instant::now();
+                let (budget, movetime) = parse_go_limits(line);
+                let deadline = movetime.map(|ms| started + Duration::from_millis(ms));
                 match &current {
                     Some(p) => {
-                        let (uci, cp) = search_best(p, budget, &current_reps, db.as_ref().map(LeafDb::as_ref), db_max, tie_base_seed());
+                        let (uci, cp, stats) = search_best(p, budget, deadline, &current_reps, db.as_ref().map(LeafDb::as_ref), db_max, tie_base_seed());
+                        let elapsed_ms = started.elapsed().as_millis() as u64;
                         if uci == "(none)" {
                             println!("bestmove (none)");
                         } else {
                             // `info … score cp` is what whole-game analysis reads; bestmove
-                            // alone drives PvE play. Emit both.
-                            println!("info score cp {cp} pv {uci}");
+                            // alone drives PvE play. The depth/nodes/nps/time in front of the
+                            // score are what the search CONSUMED, so the host can compare it
+                            // against the budget it granted. Emit both lines.
+                            println!("{}", search_info_line(&stats, elapsed_ms, cp, &uci));
                             println!("bestmove {uci}");
                         }
                     }
@@ -379,6 +450,155 @@ mod fen_tests {
             seen.insert(f);
         }
         assert!(seen.len() >= 2, "nonzero seeds should produce variety, got {seen:?}");
+    }
+
+    #[test]
+    fn search_info_reports_real_consumption_not_the_budget() {
+        // `nodes` must be the search's own visited count. A field that echoes the caller's
+        // budget back looks like measurement and answers nothing, so assert it lands NEAR the
+        // cap without being derivable from it (tick counts, then aborts, hence budget + 1).
+        // The opening is all chance nodes, so no budget this size finishes it.
+        let pool = "R1C1D1W1P1T1L1E1r1c1d1w1p1t1l1e1";
+        let p = state_from_fen(&format!("XXXX/XXXX/XXXX/XXXX - {pool} 0 0")).expect("parse");
+        let budget = 200_000u64;
+        let ((frm, to), score, stats) = engine::best_move_scored_stats(
+            &state_of(&p), budget, None, CONTEMPT, W_MOB, DEFAULT_VALUES, MAX_DEPTH, None, 0,
+            DOM_TERM, REP_DETECT, WIN_DIST, &[], 0,
+        );
+        assert!(stats.nodes > budget / 2, "{} nodes", stats.nodes);
+        assert!(stats.nodes <= budget + 1, "{} nodes", stats.nodes);
+        assert!(stats.depth >= 1, "depth {} — at least one iteration completes", stats.depth);
+        let cp = (score.clamp(-1.0, 1.0) * 1000.0).round() as i64;
+        let line = search_info_line(&stats, 123, cp, &move_to_uci((frm, to)));
+        assert!(
+            line.starts_with(&format!("info depth {} nodes {} nps ", stats.depth, stats.nodes)),
+            "{line}"
+        );
+        assert!(line.contains(&format!(" time 123 score cp {cp} pv ")), "{line}");
+    }
+
+    #[test]
+    fn a_bigger_budget_is_actually_spent() {
+        // Consumption tracks the budget rather than being a constant: raising the cap raises
+        // the reported count. That is what makes the host's allowed-vs-consumed comparison
+        // meaningful instead of decorative.
+        let pool = "R1C1D1W1P1T1L1E1r1c1d1w1p1t1l1e1";
+        let p = state_from_fen(&format!("XXXX/XXXX/XXXX/XXXX - {pool} 0 0")).expect("parse");
+        let st = state_of(&p);
+        let run = |budget: u64| {
+            engine::best_move_scored_stats(
+                &st, budget, None, CONTEMPT, W_MOB, DEFAULT_VALUES, MAX_DEPTH, None, 0, DOM_TERM,
+                REP_DETECT, WIN_DIST, &[], 0,
+            )
+            .2
+            .nodes
+        };
+        let small = run(50_000);
+        let large = run(400_000);
+        assert!(large > small * 2, "{small} -> {large} nodes as the budget grew 8x");
+    }
+
+    #[test]
+    fn search_info_omits_fields_the_search_did_not_produce() {
+        // Nothing completed and no measurable elapsed: depth and nps are absent, not zeroed or
+        // estimated. `nodes`, `time`, `score` and `pv` are always present.
+        let stats = engine::SearchStats { nodes: 7, depth: 0 };
+        assert_eq!(
+            search_info_line(&stats, 0, -12, "a0a1"),
+            "info nodes 7 time 0 score cp -12 pv a0a1"
+        );
+    }
+
+    #[test]
+    fn reported_nodes_exclude_the_tie_break_pass() {
+        // The tie-break pass resets the node counter to give itself headroom, so a snapshot
+        // taken after it would report the pass's work (small) instead of the search's. The
+        // opening is a 16-way exact tie, so it always runs; both seeds must report the same,
+        // budget-shaped count.
+        let pool = "R1C1D1W1P1T1L1E1r1c1d1w1p1t1l1e1";
+        let p = state_from_fen(&format!("XXXX/XXXX/XXXX/XXXX - {pool} 0 0")).expect("parse");
+        let st = state_of(&p);
+        let nodes = |seed: u64| {
+            engine::best_move_scored_stats(
+                &st, 200_000, None, CONTEMPT, W_MOB, DEFAULT_VALUES, MAX_DEPTH, None, 0,
+                DOM_TERM, REP_DETECT, WIN_DIST, &[], seed,
+            )
+            .2
+            .nodes
+        };
+        assert_eq!(nodes(0), nodes(12345), "the tie-break pass must not perturb the count");
+        assert!(nodes(12345) > 100_000, "{} nodes", nodes(12345));
+    }
+
+    // ── `go` limits ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_bare_go_is_node_bounded_and_has_no_deadline() {
+        // The reproducible path: the default node budget is the whole limit, and no wall
+        // clock is attached to it (a clock would make a bare `go` host-dependent).
+        assert_eq!(parse_go_limits("go"), (DEFAULT_NODES, None));
+    }
+
+    #[test]
+    fn go_nodes_is_untouched_by_the_deadline_work() {
+        assert_eq!(parse_go_limits("go nodes 1000"), (1000, None));
+        assert_eq!(parse_go_limits("go nodes 512000"), (512_000, None));
+    }
+
+    #[test]
+    fn movetime_is_never_converted_into_a_node_ceiling() {
+        // THE regression. `movetime` used to be turned into a node budget via a fixed
+        // nodes-per-millisecond constant, and 300 and 1200 both collapsed onto the same 512k
+        // default cap: the two searches visited an identical 512,001 nodes and differed only
+        // in wall time. So the guard is that the node budget must NOT be a function of the
+        // requested time — the time is carried out of here as time, and honored as time.
+        let (b300, mt300) = parse_go_limits("go movetime 300");
+        let (b1200, mt1200) = parse_go_limits("go movetime 1200");
+        assert_eq!(mt300, Some(300));
+        assert_eq!(mt1200, Some(1200));
+        assert_eq!(b300, b1200, "the node budget must not vary with the requested time");
+        assert_eq!(b300, u64::MAX, "a time-bounded search gets no work limit of its own");
+    }
+
+    #[test]
+    fn an_explicit_node_budget_still_binds_alongside_movetime() {
+        // "Whichever is reached first": naming both keeps both.
+        assert_eq!(parse_go_limits("go movetime 300 nodes 1000"), (1000, Some(300)));
+        assert_eq!(parse_go_limits("go nodes 1000 movetime 300"), (1000, Some(300)));
+    }
+
+    #[test]
+    fn an_unparseable_limit_falls_back_to_the_token_being_absent() {
+        // Fail-open: a malformed `go` still searches rather than refusing to move.
+        assert_eq!(parse_go_limits("go movetime"), (DEFAULT_NODES, None));
+        assert_eq!(parse_go_limits("go nodes abc"), (DEFAULT_NODES, None));
+    }
+
+    #[test]
+    fn a_movetime_search_stops_near_the_deadline_end_to_end() {
+        // The whole path the `go` handler takes, including the post-search tie-break pass
+        // (nonzero base seed), against a node budget that could never bind. The opening is
+        // all chance nodes, so nothing here terminates on its own.
+        let pool = "R1C1D1W1P1T1L1E1r1c1d1w1p1t1l1e1";
+        let p = state_from_fen(&format!("XXXX/XXXX/XXXX/XXXX - {pool} 0 0")).expect("parse");
+        let started = Instant::now();
+        let (uci, _cp, stats) = search_best(
+            &p,
+            u64::MAX,
+            Some(started + Duration::from_millis(150)),
+            &[],
+            None,
+            0,
+            12345,
+        );
+        let elapsed = started.elapsed();
+        assert_ne!(uci, "(none)", "a deadlined search still returns a move");
+        // Loose upper bound: this asserts the deadline BINDS, not how precise it is. A
+        // node-ceiling conversion would run to 512k nodes and blow straight past it; the
+        // machine being busy is the only thing that should put us anywhere near 3 s.
+        assert!(elapsed < std::time::Duration::from_secs(3), "elapsed {elapsed:?}");
+        assert!(stats.nodes > 0, "the search ran");
+        assert!(stats.nodes < u64::MAX, "the node budget did not bind");
     }
 
     #[test]
@@ -456,18 +676,18 @@ mod fen_tests {
         let p = state_from_fen(root).expect("root");
 
         // History-blind (legacy): the engine plays the shuffle, blind to the repetition.
-        let blind = search_best(&p, 512_000, &[], None, 0, 0).0;
+        let blind = search_best(&p, 512_000, None, &[], None, 0, 0).0;
         assert_eq!(blind, "a0a1", "without a rep seed the engine repeats");
 
         // Seed Q as already-seen: a0a1 now scores as a draw, so the engine must deviate.
         let seed = parse_rep_seed(q);
-        let aware = search_best(&p, 512_000, &seed, None, 0, 0).0;
+        let aware = search_best(&p, 512_000, None, &seed, None, 0, 0).0;
         assert_ne!(aware, "a0a1", "with the rep seed the engine avoids the threefold move");
 
         // A valid but unrelated seed must not perturb the move (no false positives).
         let unrelated = parse_rep_seed("L3/4/4/l3 b - 0 5");
         assert!(!unrelated.is_empty(), "control seed must actually parse");
-        assert_eq!(search_best(&p, 512_000, &unrelated, None, 0, 0).0, "a0a1");
+        assert_eq!(search_best(&p, 512_000, None, &unrelated, None, 0, 0).0, "a0a1");
     }
 
     #[test]
@@ -478,13 +698,13 @@ mod fen_tests {
         let p = state_from_fen("4/4/l3/L3 r - 1 60").expect("two-lion endgame");
 
         // db=None (the shipped v0.2.0 behaviour): contempt makes the engine flee the trade.
-        let fled = search_best(&p, 512_000, &[], None, 0, 0).0;
+        let fled = search_best(&p, 512_000, None, &[], None, 0, 0).0;
         assert_ne!(fled, "a0a1", "without the DB leaf the engine flees the trade");
 
         // ≤2 exact tablebase leaf: the dead draw is recognised, all moves tie, and move
         // ordering takes the trade — securing the draw immediately.
         let db = endgame::build(2).0;
-        let secured = search_best(&p, 512_000, &[], Some(engine::DbRef::Map(&db)), 2, 0).0;
+        let secured = search_best(&p, 512_000, None, &[], Some(engine::DbRef::Map(&db)), 2, 0).0;
         assert_eq!(secured, "a0a1", "the DB leaf makes the engine take the drawn trade");
     }
 
@@ -498,7 +718,7 @@ mod fen_tests {
         let p = state_from_fen("3E/1r2/3t/4 b - 0 47").expect("won 3-piece endgame");
         let db = endgame::build(2).0;
         assert_eq!(
-            search_best(&p, 512_000, &[], Some(engine::DbRef::Map(&db)), 2, 0).0,
+            search_best(&p, 512_000, None, &[], Some(engine::DbRef::Map(&db)), 2, 0).0,
             "b2c2",
             "distance-aware scoring takes the shortest forced win"
         );

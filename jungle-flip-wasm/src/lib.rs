@@ -9,8 +9,12 @@
 //! a hidden tile's identity. The FEN parser (`engine::state_from_fen`) is the SAME one the UCI
 //! binary uses, so the client and server build byte-identical masked states.
 //!
-//! Time source: `wasm32-unknown-unknown` has no monotonic clock, but the Flip Jungle engine
-//! core drives search by NODE BUDGET only (no `Instant` in engine.rs), so nothing to shim.
+//! Time source: `wasm32-unknown-unknown` has no monotonic clock (`Instant::now()` panics
+//! there). The engine core CAN take a wall-clock deadline — the UCI binary needs one to honor
+//! `go movetime` — but it reads the clock only when a deadline is actually set, and this build
+//! never sets one: the browser reaches the search through `RootAnalysisSession`, whose
+//! cancellation boundary is the node slice handed to `advance`. So there is still nothing to
+//! shim. Do not add a deadline-taking entry point here without shimming the clock first.
 
 // The engine core references `crate::{game, endgame, flatdb}`, so we mirror the crate module
 // tree here. `flatdb` is a LOCAL STUB (the real one uses rayon → no wasm); the browser engine

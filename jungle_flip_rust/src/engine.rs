@@ -320,6 +320,7 @@ impl State {
 
 // ── Search: αβ negamax + Star1 chance nodes + quiescence + contempt + TT ────────
 use std::collections::HashMap;
+use std::time::Instant;
 
 const EVAL_SCALE: f64 = 24.0;
 const VMIN: f64 = -1.0;
@@ -482,9 +483,34 @@ fn grade_db(wld: i8, dtm: u16, st: &State, cfg: &Cfg) -> f64 {
     sign * (1.0 - DB_MARGIN) + DB_MARGIN * mat
 }
 
+/// Nodes between wall-clock samples. The clock is checked every Nth node rather than every
+/// node: `Instant::now()` is ~20-25 ns and a node here costs 560-1630 ns (measured: 1.79M
+/// nodes/s on the all-face-down opening, 1.05M midgame, 0.61M on a fully-revealed position
+/// where the tablebase probe dominates), so a per-node sample would be a 2-4% tax for no
+/// resolution anyone can use.
+///
+/// The interval is the deadline's worst-case OVERSHOOT — the search cannot notice the clock
+/// between two samples. At 512 nodes that is 512 × 1.63 µs ≈ 0.84 ms at the slowest
+/// throughput measured locally, ≈ 0.40 ms at the slow end of the production host's range
+/// (1.27M nodes/s) and ≈ 0.06 ms at its fast end (8.19M). Under 1% of the shortest movetime
+/// a caller would sensibly ask for, and the sampling cost is then ~0.01% of the search.
+///
+/// Note that the interval is a NODE count, so it is self-correcting in exactly the way a
+/// nodes-per-millisecond constant is not: it makes no claim about how fast the host is. A
+/// slower host samples the clock at the same node spacing and simply reaches fewer nodes.
+const DEADLINE_CHECK_NODES: u32 = 512;
+
 struct Ctx {
     nodes: u64,
     budget: u64,
+    /// Wall-clock stop, or `None` for a purely node-bounded search. `Instant::now()` is called
+    /// ONLY when this is `Some`, which is what keeps the core usable from `wasm32-unknown-
+    /// unknown` (no monotonic clock; `Instant::now()` panics there). The wasm build reaches the
+    /// search through `RootAnalysisSession`, which never sets a deadline.
+    deadline: Option<Instant>,
+    /// Nodes still to visit before the next clock sample. Counts DOWN so that resetting
+    /// `nodes` (as the post-search tie-break pass does) cannot postpone a sample.
+    clock_countdown: u32,
     tt: std::collections::HashMap<u64, (i32, f64, u8, (u8, u8))>,
     path: Vec<u64>, // rep_keys of ancestors on the current search line (rep detection)
     killers: Vec<[(u8, u8); 2]>, // [depth] -> two quiet moves that caused a β-cutoff there
@@ -492,14 +518,54 @@ struct Ctx {
 }
 
 impl Ctx {
+    fn new(budget: u64, deadline: Option<Instant>) -> Self {
+        Ctx {
+            nodes: 0,
+            budget,
+            deadline,
+            clock_countdown: 0, // 0 => the first tick resolves the deadline branch
+            tt: std::collections::HashMap::new(),
+            path: Vec::new(),
+            killers: vec![[(255u8, 255u8); 2]; 128],
+            history: [[0u32; NSQ]; NSQ],
+        }
+    }
+
+    /// Charge one node against BOTH limits. Either one being reached is the same `Err(())`
+    /// the search has always used for a budget-out: it propagates out through `?`, the
+    /// iterative-deepening loop discards the incomplete depth, and the caller keeps the last
+    /// depth that finished. A time-out is therefore never a half-computed score.
     #[inline]
     fn tick(&mut self) -> Result<(), ()> {
         self.nodes += 1;
         if self.nodes > self.budget {
-            Err(())
-        } else {
-            Ok(())
+            return Err(());
         }
+        if self.clock_countdown == 0 {
+            return self.sample_clock();
+        }
+        self.clock_countdown -= 1;
+        Ok(())
+    }
+
+    /// The once-per-`DEADLINE_CHECK_NODES` slow path, kept out of `tick`'s inlined body.
+    #[cold]
+    #[inline(never)]
+    fn sample_clock(&mut self) -> Result<(), ()> {
+        let Some(deadline) = self.deadline else {
+            // No wall-clock limit: settle the branch once and never pay for it again.
+            self.clock_countdown = u32::MAX;
+            return Ok(());
+        };
+        if Instant::now() >= deadline {
+            // Leave the countdown at 0 so EVERY later tick lands here and aborts too. The
+            // abort has to be sticky, or an unwind that returns into a sibling loop would
+            // simply resume searching past the deadline. An `Instant` that has passed stays
+            // passed, so no separate flag is needed.
+            return Err(());
+        }
+        self.clock_countdown = DEADLINE_CHECK_NODES;
+        Ok(())
     }
 }
 
@@ -793,8 +859,7 @@ pub fn search_value(st: &State, depth: i32, w_mob: f64, values: [f64; 8]) -> f64
         win_dist: false, root_ply: st.ply, rep_seed: &[],
         order_heur: false,
     };
-    let mut ctx = Ctx { nodes: 0, budget: u64::MAX, tt: std::collections::HashMap::new(), path: Vec::new(),
-        killers: vec![[(255u8, 255u8); 2]; 128], history: [[0u32; NSQ]; NSQ] };
+    let mut ctx = Ctx::new(u64::MAX, None);
     negamax(st, depth, VMIN, VMAX, &cfg, &mut ctx).unwrap_or(0.0)
 }
 
@@ -808,8 +873,7 @@ pub fn search_nodes(st: &State, depth: i32, w_mob: f64, values: [f64; 8]) -> u64
         win_dist: false, root_ply: st.ply, rep_seed: &[],
         order_heur: std::env::var("JF_NO_ORDER_HEUR").is_err(),
     };
-    let mut ctx = Ctx { nodes: 0, budget: u64::MAX, tt: std::collections::HashMap::new(), path: Vec::new(),
-        killers: vec![[(255u8, 255u8); 2]; 128], history: [[0u32; NSQ]; NSQ] };
+    let mut ctx = Ctx::new(u64::MAX, None);
     let _ = best_at_depth(st, depth, &cfg, &mut ctx, None);
     ctx.nodes
 }
@@ -858,8 +922,7 @@ pub fn search_eval(
     if res != RES_ONGOING {
         return terminal_value(st, res, &cfg);
     }
-    let mut ctx = Ctx { nodes: 0, budget: node_budget, tt: std::collections::HashMap::new(), path: Vec::new(),
-        killers: vec![[(255u8, 255u8); 2]; 128], history: [[0u32; NSQ]; NSQ] };
+    let mut ctx = Ctx::new(node_budget, None);
     let mut val = 0.0;
     let mut hint = None;
     for depth in 1..=max_depth {
@@ -887,6 +950,11 @@ fn splitmix64(x: u64) -> u64 {
 /// α and hides them). Meant to run AFTER the strength-determining deepening, over its
 /// warm TT, so it is cheap and does not steal search depth. `ctx.nodes` is reset to
 /// give the pass its own headroom; a mid-pass budget-out falls back to `primary`.
+///
+/// The reset grants NODE headroom only. A wall-clock deadline that has already passed keeps
+/// aborting (see `Ctx::sample_clock`), so this pass costs a time-bounded search nothing: its
+/// first `move_value` returns `Err` and the proven best move stands. That is deliberate —
+/// headroom past a deadline the caller is waiting on is exactly the overshoot to avoid.
 #[allow(clippy::float_cmp)] // exact equality is intentional: only bit-identical evals tie
 fn root_ties_at_depth(
     st: &State, depth: i32, cfg: &Cfg, ctx: &mut Ctx, hint: Option<(u8, u8)>, primary: (u8, u8),
@@ -939,6 +1007,18 @@ pub fn best_move(
     .0
 }
 
+/// What a search actually CONSUMED, as opposed to what it was allowed. `nodes` is the real
+/// visited-node count of the strength-determining iterative deepening (never the budget echoed
+/// back, and never including the post-search tie-break pass, which runs on its own headroom).
+/// `depth` is the last iteration that ran to COMPLETION — 0 if even the first was cut short,
+/// since an incomplete depth is discarded rather than "reached". A caller comparing these
+/// against the budget it handed in can tell a work-bound search from a time-bound one.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SearchStats {
+    pub nodes: u64,
+    pub depth: i32,
+}
+
 /// Like `best_move` but also returns the root value (side-to-move perspective, ~[-1, 1]) from
 /// the deepest completed depth, so the UCI front-end can emit an `info … score` line for
 /// whole-game analysis. One search; move selection (incl. the tie-break) is identical to
@@ -949,6 +1029,29 @@ pub fn best_move_scored(
     db: Option<DbRef>, db_max: usize, dom_term: bool, rep_detect: bool, win_dist: bool,
     rep_seed: &[u64], rng_seed: u64,
 ) -> ((u8, u8), f64) {
+    let (m, score, _) = best_move_scored_stats(
+        st, node_budget, None, contempt, w_mob, values, max_depth, db, db_max, dom_term,
+        rep_detect, win_dist, rep_seed, rng_seed,
+    );
+    (m, score)
+}
+
+/// Like `best_move_scored` but takes a wall-clock `deadline` alongside the node budget and
+/// also returns what the search consumed (`SearchStats`). This is the body `best_move_scored`
+/// funnels into: with `deadline: None` the search is byte-for-byte the same, and the stats are
+/// read off the counter `Ctx` already keeps to honour the node budget.
+///
+/// The two limits are independent and BOTH are honoured — whichever is reached first ends the
+/// search. `deadline: None` means no wall-clock bound (a node-bounded search is reproducible
+/// run to run; a deadlined one is not, by construction). Pass `u64::MAX` as `node_budget` for
+/// a purely time-bounded search.
+#[allow(clippy::too_many_arguments)]
+pub fn best_move_scored_stats(
+    st: &State, node_budget: u64, deadline: Option<Instant>, contempt: f64, w_mob: f64,
+    values: [f64; 8], max_depth: i32,
+    db: Option<DbRef>, db_max: usize, dom_term: bool, rep_detect: bool, win_dist: bool,
+    rep_seed: &[u64], rng_seed: u64,
+) -> ((u8, u8), f64, SearchStats) {
     let cfg = Cfg {
         w_mob, values, contempt, root: st.mover_color(),
         quiesce: true, quiesce_max: 8, db, db_max, dom_term, rep_detect,
@@ -958,10 +1061,9 @@ pub fn best_move_scored(
     let mut mv: Vec<(u8, u8)> = Vec::new();
     st.legal_moves(&mut mv);
     if mv.is_empty() {
-        return ((255, 255), 0.0);
+        return ((255, 255), 0.0, SearchStats::default());
     }
-    let mut ctx = Ctx { nodes: 0, budget: node_budget, tt: std::collections::HashMap::new(), path: Vec::new(),
-        killers: vec![[(255u8, 255u8); 2]; 128], history: [[0u32; NSQ]; NSQ] };
+    let mut ctx = Ctx::new(node_budget, deadline);
     let mut best = mv[0];
     let mut best_score = 0.0f64;
     let mut hint = None;
@@ -974,21 +1076,29 @@ pub fn best_move_scored(
                 hint = Some(m);
                 last_depth = depth;
             }
-            _ => break, // budget exceeded (or no move)
+            // Node budget spent, deadline reached, or no move. Either limit aborts the same
+            // way, and the incomplete depth is discarded either way: `best`/`best_score` are
+            // still whatever the last COMPLETED depth proved, never a partial result.
+            _ => break,
         }
     }
+    // Snapshot consumption HERE, before the tie-break pass: `root_ties_at_depth` resets
+    // `ctx.nodes` to give itself headroom, so reading the counter afterwards would report the
+    // tie pass's own work instead of the search's. `node_budget` bounds the deepening above,
+    // so this is the number that answers "did the work limit bind?".
+    let stats = SearchStats { nodes: ctx.nodes, depth: last_depth };
     if rng_seed == 0 || last_depth == 0 {
         // rng_seed==0 is the reserved "off" value: legacy deterministic behavior
         // (first-ordered best). last_depth==0 means depth 1 never completed.
-        return (best, best_score);
+        return (best, best_score, stats);
     }
     // Break exact ties among equal-best root moves. `best` is always in the tie set.
     let ties = root_ties_at_depth(st, last_depth, &cfg, &mut ctx, Some(best), best);
     if ties.len() <= 1 {
-        return (best, best_score);
+        return (best, best_score, stats);
     }
     let idx = (splitmix64(rng_seed) % ties.len() as u64) as usize;
-    (ties[idx], best_score)
+    (ties[idx], best_score, stats)
 }
 
 // ============================================================================
@@ -1243,14 +1353,7 @@ pub fn root_move_values(
     if roots.is_empty() {
         return Vec::new();
     }
-    let mut ctx = Ctx {
-        nodes: 0,
-        budget: node_budget,
-        tt: std::collections::HashMap::new(),
-        path: Vec::new(),
-        killers: vec![[(255u8, 255u8); 2]; 128],
-        history: [[0u32; NSQ]; NSQ],
-    };
+    let mut ctx = Ctx::new(node_budget, None);
     let mut completed: Vec<(u8, u8, f64)> = Vec::new();
     let mut depth_reached = 0;
     let mut hint: Option<(u8, u8)> = None;
@@ -1337,14 +1440,9 @@ impl RootAnalysisSession {
             rep_detect,
             win_dist,
             rep_seed: rep_seed.to_vec(),
-            ctx: Ctx {
-                nodes: 0,
-                budget: 0,
-                tt: std::collections::HashMap::new(),
-                path: Vec::new(),
-                killers: vec![[(255u8, 255u8); 2]; 128],
-                history: [[0u32; NSQ]; NSQ],
-            },
+            // No deadline: the browser's cancellation boundary is the node slice handed to
+            // `advance`, and `wasm32-unknown-unknown` has no monotonic clock to read anyway.
+            ctx: Ctx::new(0, None),
             completed: Vec::new(),
             depth_reached: 0,
             hint: None,
@@ -1471,6 +1569,108 @@ fn root_orbit_key(st: &State, m: (u8, u8)) -> (u8, u8) {
         }
     }
     best
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use std::time::Duration;
+
+    // All face-down: every root move is a chance node, so no budget and no deadline used here
+    // ever exhausts the tree. A search that stops, stopped because a limit made it.
+    const OPENING_FEN: &str = "XXXX/XXXX/XXXX/XXXX - R1C1D1W1P1T1L1E1r1c1d1w1p1t1l1e1 0 1";
+    const VALUES: [f64; 8] = [6.0, 2.0, 3.0, 4.0, 5.0, 7.0, 8.0, 10.0];
+
+    fn opening() -> State {
+        state_of(&state_from_fen(OPENING_FEN).expect("valid opening FEN"))
+    }
+
+    fn search(
+        st: &State, budget: u64, deadline: Option<Instant>, rng_seed: u64,
+    ) -> ((u8, u8), f64, SearchStats) {
+        best_move_scored_stats(
+            st, budget, deadline, 0.05, 0.8, VALUES, 24, None, 0, false, true, true, &[], rng_seed,
+        )
+    }
+
+    #[test]
+    fn a_deadline_stops_a_search_no_node_budget_would() {
+        // `u64::MAX` nodes: the ONLY thing that can end this search is the clock. Before the
+        // deadline existed, `movetime` was a derived node ceiling and this call would have run
+        // until MAX_DEPTH or the heat death of the laptop.
+        let st = opening();
+        let started = Instant::now();
+        let (_m, _v, stats) = search(&st, u64::MAX, Some(started + Duration::from_millis(200)), 0);
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(3), "elapsed {elapsed:?}");
+        assert!(elapsed >= Duration::from_millis(150), "stopped implausibly early: {elapsed:?}");
+        assert!(stats.nodes > 0);
+    }
+
+    #[test]
+    fn a_longer_deadline_searches_more() {
+        // The 300-vs-1200 pair, at the library boundary: two deadlines a factor of six apart
+        // must produce two different node counts. They used to produce byte-identical ones.
+        let st = opening();
+        let run = |ms: u64| {
+            let started = Instant::now();
+            search(&st, u64::MAX, Some(started + Duration::from_millis(ms)), 0).2.nodes
+        };
+        let short = run(100);
+        let long = run(600);
+        assert!(long > short, "{short} nodes in 100ms vs {long} in 600ms");
+    }
+
+    #[test]
+    fn an_expired_deadline_returns_a_legal_move_and_claims_no_completed_depth() {
+        // Abort semantics: a deadline that has already passed cuts depth 1 short, so there is
+        // no completed iteration to report. The result must still be a legal move (partial
+        // results stay usable), and must NOT be dressed up as a finished search — `depth 0` is
+        // what the info line omits rather than reporting.
+        let st = opening();
+        let (m, score, stats) = search(&st, u64::MAX, Some(Instant::now()), 0);
+        let mut legal = Vec::new();
+        st.legal_moves(&mut legal);
+        assert!(legal.contains(&m), "{m:?} is not legal");
+        assert_eq!(stats.depth, 0, "nothing completed, so nothing is claimed");
+        assert_eq!(score, 0.0, "no completed depth means no score, not a partial one");
+    }
+
+    #[test]
+    fn an_expired_deadline_also_stops_the_tie_break_pass() {
+        // `root_ties_at_depth` resets the node counter to give itself headroom. That headroom
+        // is NODE headroom: a passed deadline has to keep aborting, or the pass would run a
+        // full extra root re-search after the caller's clock ran out. Nonzero seed => the pass
+        // is reached; the assertion is that reaching it costs almost nothing.
+        let st = opening();
+        let started = Instant::now();
+        let _ = search(&st, u64::MAX, Some(started + Duration::from_millis(120)), 999);
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(2), "elapsed {elapsed:?}");
+    }
+
+    #[test]
+    fn a_generous_deadline_leaves_a_node_bounded_search_bit_identical() {
+        // The compatibility guarantee: when the clock cannot bind, the deadline machinery is
+        // invisible. Same move, same score bit-for-bit, same consumption.
+        let st = opening();
+        let (m0, v0, s0) = search(&st, 200_000, None, 0);
+        let (m1, v1, s1) = search(&st, 200_000, Some(Instant::now() + Duration::from_secs(600)), 0);
+        assert_eq!(m0, m1);
+        assert_eq!(v0.to_bits(), v1.to_bits());
+        assert_eq!(s0.nodes, s1.nodes);
+        assert_eq!(s0.depth, s1.depth);
+    }
+
+    #[test]
+    fn the_node_budget_still_binds_when_a_deadline_is_present_but_far_away() {
+        // "Whichever is reached first": with a distant deadline the node limit is what stops
+        // the search, and it stops it at exactly the same node it always did.
+        let st = opening();
+        let (_m, _v, stats) =
+            search(&st, 50_000, Some(Instant::now() + Duration::from_secs(600)), 0);
+        assert_eq!(stats.nodes, 50_001, "ticked to the cap, then aborted");
+    }
 }
 
 #[cfg(test)]
