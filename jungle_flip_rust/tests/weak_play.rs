@@ -1,4 +1,6 @@
 use jungle_flip_rust::engine::*;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 const VALUES: [f64; 8] = [6., 2., 3., 4., 5., 7., 8., 10.];
 
@@ -17,10 +19,20 @@ fn position(pieces: &[(usize, i16)]) -> State {
 }
 
 fn select(st: &State, play: PlayOptions, seed: u64) -> ((u8, u8), f64, SearchStats) {
+    select_with_limits(st, play, seed, 400, None)
+}
+
+fn select_with_limits(
+    st: &State,
+    play: PlayOptions,
+    seed: u64,
+    nodes: u64,
+    deadline: Option<Instant>,
+) -> ((u8, u8), f64, SearchStats) {
     select_move_scored_stats(
         st,
-        400,
-        None,
+        nodes,
+        deadline,
         0.05,
         0.8,
         VALUES,
@@ -326,7 +338,10 @@ fn noise_depth_zero_is_depth_one_and_deeper_scores_match_a_full_root_pass() {
         &[],
     );
     for seed in 0..32 {
-        let (one, three) = (select(&st, at(1), seed), select(&st, at(3), seed));
+        let (one, three) = (
+            select(&st, at(1), seed),
+            select_with_limits(&st, at(3), seed, u64::MAX, None),
+        );
         assert_eq!(three.2.depth, 3);
         assert!(three.2.nodes > one.2.nodes);
         let v = roots
@@ -342,4 +357,76 @@ fn noise_depth_zero_is_depth_one_and_deeper_scores_match_a_full_root_pass() {
     }
     .validate()
     .is_err());
+}
+
+// Keep a runaway search from hanging the test process if either limit regresses.
+fn opening_with_timeout(nodes: u64, movetime: Option<Duration>) -> ((u8, u8), f64, SearchStats) {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let opening = State {
+            sq: [DOWN; 16],
+            bag: [1; 16],
+            first_color: -1,
+            ply: 0,
+            no_progress: 0,
+        };
+        let result = select_with_limits(
+            &opening,
+            PlayOptions {
+                noise: 0.01,
+                noise_depth: 4,
+                ..Default::default()
+            },
+            123,
+            nodes,
+            movetime.map(|duration| Instant::now() + duration),
+        );
+        let _ = tx.send(result);
+    });
+    rx.recv_timeout(Duration::from_secs(2))
+        .expect("noisy opening search exceeded 2 seconds")
+}
+
+#[test]
+fn noisy_opening_depth_four_obeys_movetime() {
+    let started = Instant::now();
+    let (m, value, stats) = opening_with_timeout(u64::MAX, Some(Duration::from_millis(1000)));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(m.0, m.1);
+    assert!(m.0 < 16);
+    assert!(value.is_finite());
+    assert!((1..4).contains(&stats.depth));
+    assert!(stats.nodes > 0);
+}
+
+#[test]
+fn noisy_opening_depth_four_obeys_nodes_without_a_deadline() {
+    let (m, value, stats) = opening_with_timeout(10_000, None);
+    assert_eq!(m.0, m.1);
+    assert!(m.0 < 16);
+    assert!(value.is_finite());
+    assert!((1..4).contains(&stats.depth));
+    assert_eq!(stats.nodes, 10_001);
+}
+
+#[test]
+fn nonbinding_limits_replay_the_same_noisy_move_and_value() {
+    let mut st = position(&[(0, 1), (5, DOWN), (10, DOWN), (15, DOWN), (14, 15)]);
+    st.bag[2] = 2;
+    st.bag[8] = 1;
+    let play = PlayOptions {
+        noise: 0.3,
+        noise_depth: 3,
+        ..Default::default()
+    };
+    for seed in [1, 123, 456] {
+        let deadline = Some(Instant::now() + Duration::from_secs(60));
+        let a = select_with_limits(&st, play, seed, 10_000_000, deadline);
+        let b = select_with_limits(&st, play, seed, 10_000_000, deadline);
+        assert_eq!(
+            (a.0, a.1.to_bits(), a.2.depth, a.2.nodes),
+            (b.0, b.1.to_bits(), b.2.depth, b.2.nodes)
+        );
+        assert_eq!(a.2.depth, 3);
+    }
 }

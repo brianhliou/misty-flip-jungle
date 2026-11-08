@@ -121,7 +121,7 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::time::{Duration, Instant};
 
-const ENGINE_NAME: &str = "MistyJungleFlip 0.5.3";
+const ENGINE_NAME: &str = "MistyJungleFlip 0.5.4";
 /// Node budget for a `go` that names neither limit. Deliberately NOT a time budget: a bare
 /// `go` is the reproducible path the golden vectors depend on, and a wall clock would make it
 /// host-dependent.

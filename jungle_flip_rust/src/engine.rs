@@ -528,10 +528,10 @@ pub fn guarded_root_moves(st: &State) -> Vec<(u8, u8)> {
     }
 }
 
-/// Guarded weak-play selection. Noise uses a FIXED-depth (noise_depth) full-window root pass
+/// Guarded weak-play selection. Noise deepens full-window root passes up to noise_depth
 /// with the normal 8-ply capture quiescence, classical evaluation, tablebases, history and Star1 reveals.
-/// Every legal move is scored, with no partial-pass bias or node/deadline abort;
-/// noisy play's work limit is this shallow horizon, not the pure-search budget.
+/// Depth 1 is unlimited; later passes share the caller's node budget and deadline.
+/// Only the deepest complete pass is used, with the same noise draws at every depth.
 /// Mix is sampled after the guards; even its search branch cannot pick an unsafe
 /// move. Disabled settings do no guard work and consume no random numbers.
 #[allow(clippy::too_many_arguments)]
@@ -618,52 +618,265 @@ pub fn select_move_scored_stats(
         rep_seed,
         order_heur: std::env::var("JF_NO_ORDER_HEUR").is_err(),
     };
-    noisy_root_choice(st, &cfg, &allowed, play.noise, play.noise_depth.max(1), rng)
+    noisy_root_choice(
+        st,
+        &cfg,
+        &allowed,
+        play.noise,
+        play.noise_depth.max(1),
+        node_budget,
+        deadline,
+        rng,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn noisy_root_choice(
     st: &State,
     cfg: &Cfg,
     allowed: &[(u8, u8)],
     sigma: f64,
     depth: i32,
+    node_budget: u64,
+    deadline: Option<Instant>,
     rng: &mut PlayRng,
 ) -> ((u8, u8), f64, SearchStats) {
     let mut ctx = Ctx::new(u64::MAX, None);
-    if cfg.rep_detect {
-        ctx.path.push(st.rep_key());
-        ctx.path.extend_from_slice(cfg.rep_seed);
-    }
     let moves = ordered_moves(st, &cfg.values, None, &ctx.killers[1], &ctx.history);
-    let (mut best, mut value, mut noisy_best) = (allowed[0], 0., -INF);
-    for m in moves {
-        let v = move_value(st, m, depth, VMIN, VMAX, cfg, &mut ctx).expect("uncapped root pass");
-        // Compare in sigma-normalized space to avoid overflow for finite huge sigma.
-        let z = rng.gaussian();
-        let noisy = if sigma >= 1. {
-            v / sigma + z
-        } else {
-            v + sigma * z
-        };
-        if allowed.contains(&m) && noisy > noisy_best {
-            best = m;
-            value = v;
-            noisy_best = noisy;
+    // Sample every root, including guarded-out moves, in the original order.
+    // Reusing these draws preserves both the chosen move and the RNG stream.
+    let noise: Vec<_> = moves.iter().map(|_| rng.gaussian()).collect();
+    let (mut best, mut value) = (allowed[0], 0.);
+    let mut stats = SearchStats::default();
+    for d in 1..=depth {
+        if d > 1 {
+            // No TT, killers or history survive from a shallower pass, so an
+            // unlimited final pass scores exactly like the old fixed-depth pass.
+            ctx = Ctx::new(node_budget.saturating_sub(stats.nodes), deadline);
         }
+        if cfg.rep_detect {
+            ctx.path.push(st.rep_key());
+            ctx.path.extend_from_slice(cfg.rep_seed);
+        }
+        let (mut pass_best, mut pass_value, mut noisy_best) = (allowed[0], 0., -INF);
+        let mut complete = true;
+        for (&m, &z) in moves.iter().zip(&noise) {
+            let Ok(v) = move_value(st, m, d, VMIN, VMAX, cfg, &mut ctx) else {
+                complete = false;
+                break;
+            };
+            // Compare in sigma-normalized space to avoid overflow for finite huge sigma.
+            let noisy = if sigma >= 1. {
+                v / sigma + z
+            } else {
+                v + sigma * z
+            };
+            if allowed.contains(&m) && noisy > noisy_best {
+                pass_best = m;
+                pass_value = v;
+                noisy_best = noisy;
+            }
+        }
+        stats.nodes = stats.nodes.saturating_add(ctx.nodes);
+        if !complete {
+            break;
+        }
+        best = pass_best;
+        value = pass_value;
+        stats.depth = d;
     }
-    (
-        best,
-        value,
-        SearchStats {
-            depth,
-            nodes: ctx.nodes,
-        },
-    )
+    (best, value, stats)
 }
 
 #[cfg(test)]
 mod weak_play_tests {
     use super::*;
+
+    // Pre-v0.5.4 fixed-depth implementation, retained to verify exact compatibility.
+    fn old_noisy_root_choice(
+        st: &State,
+        cfg: &Cfg,
+        allowed: &[(u8, u8)],
+        sigma: f64,
+        depth: i32,
+        rng: &mut PlayRng,
+    ) -> ((u8, u8), f64, SearchStats) {
+        let mut ctx = Ctx::new(u64::MAX, None);
+        if cfg.rep_detect {
+            ctx.path.push(st.rep_key());
+            ctx.path.extend_from_slice(cfg.rep_seed);
+        }
+        let moves = ordered_moves(st, &cfg.values, None, &ctx.killers[1], &ctx.history);
+        let (mut best, mut value, mut noisy_best) = (allowed[0], 0., -INF);
+        for m in moves {
+            let v =
+                move_value(st, m, depth, VMIN, VMAX, cfg, &mut ctx).expect("uncapped root pass");
+            // Compare in sigma-normalized space to avoid overflow for finite huge sigma.
+            let z = rng.gaussian();
+            let noisy = if sigma >= 1. {
+                v / sigma + z
+            } else {
+                v + sigma * z
+            };
+            if allowed.contains(&m) && noisy > noisy_best {
+                best = m;
+                value = v;
+                noisy_best = noisy;
+            }
+        }
+        (
+            best,
+            value,
+            SearchStats {
+                depth,
+                nodes: ctx.nodes,
+            },
+        )
+    }
+
+    fn noisy_test_cfg(st: &State) -> Cfg<'_> {
+        Cfg {
+            w_mob: 0.8,
+            values: [6., 2., 3., 4., 5., 7., 8., 10.],
+            contempt: 0.05,
+            root: st.mover_color(),
+            quiesce: true,
+            quiesce_max: 8,
+            db: None,
+            db_max: 0,
+            dom_term: false,
+            rep_detect: true,
+            win_dist: true,
+            root_ply: st.ply,
+            rep_seed: &[],
+            order_heur: true,
+        }
+    }
+
+    fn masked_position() -> State {
+        let mut st = State {
+            sq: [EMPTY; 16],
+            bag: [0; 16],
+            first_color: 0,
+            ply: 0,
+            no_progress: 0,
+        };
+        for (sq, code) in [(0, 1), (5, DOWN), (10, DOWN), (15, DOWN), (14, 15)] {
+            st.sq[sq] = code;
+        }
+        st.bag[2] = 2;
+        st.bag[8] = 1;
+        st
+    }
+
+    #[test]
+    fn unlimited_noisy_pass_matches_old_move_value_and_rng_bits() {
+        let opening = State {
+            sq: [DOWN; 16],
+            bag: [1; 16],
+            first_color: -1,
+            ply: 0,
+            no_progress: 0,
+        };
+        let masked = masked_position();
+        let mut revealed = masked.clone();
+        revealed.sq[5] = 2;
+        revealed.sq[10] = 2;
+        revealed.sq[15] = 8;
+        revealed.bag = [0; 16];
+        revealed.ply = 7;
+        for (st, depth) in [(opening, 2), (masked, 3), (revealed, 4)] {
+            let cfg = noisy_test_cfg(&st);
+            let allowed = guarded_root_moves(&st);
+            let total_nodes: u64 = (1..=depth)
+                .map(|d| {
+                    old_noisy_root_choice(&st, &cfg, &allowed, 0.01, d, &mut PlayRng::new(0))
+                        .2
+                        .nodes
+                })
+                .sum();
+            for sigma in [0.01, 0.3, 100., f64::MAX] {
+                for seed in [0, 1, 123] {
+                    let (mut old_rng, mut rng) = (PlayRng::new(seed), PlayRng::new(seed));
+                    let old =
+                        old_noisy_root_choice(&st, &cfg, &allowed, sigma, depth, &mut old_rng);
+                    let new = noisy_root_choice(
+                        &st,
+                        &cfg,
+                        &allowed,
+                        sigma,
+                        depth,
+                        u64::MAX,
+                        None,
+                        &mut rng,
+                    );
+                    assert_eq!(
+                        (new.0, new.1.to_bits(), new.2.depth),
+                        (old.0, old.1.to_bits(), old.2.depth)
+                    );
+                    assert_eq!(new.2.nodes, total_nodes);
+                    assert_eq!(format!("{rng:?}"), format!("{old_rng:?}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aborted_noisy_pass_keeps_only_the_last_complete_depth_and_counts_all_nodes() {
+        let st = masked_position();
+        let cfg = noisy_test_cfg(&st);
+        let allowed = guarded_root_moves(&st);
+        let old =
+            |depth| old_noisy_root_choice(&st, &cfg, &allowed, 0.3, depth, &mut PlayRng::new(123));
+        let (one, two, three) = (old(1), old(2), old(3));
+        // First exhaust the budget in depth 2, then partway through depth 3.
+        for (budget, expected) in [
+            (one.2.nodes + two.2.nodes / 2, one),
+            (one.2.nodes + two.2.nodes + three.2.nodes / 2, two),
+        ] {
+            let mut rng = PlayRng::new(123);
+            let new = noisy_root_choice(&st, &cfg, &allowed, 0.3, 4, budget, None, &mut rng);
+            assert_eq!(
+                (new.0, new.1.to_bits(), new.2.depth),
+                (expected.0, expected.1.to_bits(), expected.2.depth)
+            );
+            assert_eq!(new.2.nodes, budget + 1);
+            let mut expected_rng = PlayRng::new(123);
+            old_noisy_root_choice(&st, &cfg, &allowed, 0.3, 1, &mut expected_rng);
+            assert_eq!(format!("{rng:?}"), format!("{expected_rng:?}"));
+        }
+        // Even a zero budget and an expired deadline must finish depth 1.
+        let new = noisy_root_choice(
+            &st,
+            &cfg,
+            &allowed,
+            0.3,
+            4,
+            0,
+            Some(Instant::now()),
+            &mut PlayRng::new(123),
+        );
+        assert_eq!(
+            (new.0, new.1.to_bits(), new.2.depth),
+            (one.0, one.1.to_bits(), 1)
+        );
+        assert_eq!(new.2.nodes, one.2.nodes + 1);
+        let expired = noisy_root_choice(
+            &st,
+            &cfg,
+            &allowed,
+            0.3,
+            4,
+            u64::MAX,
+            Some(Instant::now()),
+            &mut PlayRng::new(123),
+        );
+        assert_eq!(
+            (expired.0, expired.1.to_bits(), expired.2.depth),
+            (one.0, one.1.to_bits(), 1)
+        );
+        assert_eq!(expired.2.nodes, one.2.nodes + 1);
+    }
 
     #[test]
     fn gaussian_is_replayable_centered_and_unit_variance() {
@@ -711,7 +924,17 @@ mod weak_play_tests {
         st.legal_moves(&mut legal);
         let seed = (0..64)
             .find(|&seed| {
-                noisy_root_choice(&st, &cfg, &legal, 100., 1, &mut PlayRng::new(seed)).0 != (0, 1)
+                noisy_root_choice(
+                    &st,
+                    &cfg,
+                    &legal,
+                    100.,
+                    1,
+                    u64::MAX,
+                    None,
+                    &mut PlayRng::new(seed),
+                )
+                .0 != (0, 1)
             })
             .expect("large noise must sometimes miss the win without guards");
         let guarded = select_move_scored_stats(
@@ -1367,9 +1590,9 @@ pub fn best_move(
 }
 
 /// What a search actually CONSUMED, as opposed to what it was allowed. `nodes` is the real
-/// visited-node count of iterative deepening or the fixed-depth noisy pass. It excludes the
-/// post-search tie-break pass, which runs on its own headroom.
-/// `depth` is the last completed iteration or fixed-depth pass, or 0 if none completed,
+/// visited-node count across all iterations, including an aborted noisy pass. It excludes
+/// the post-search tie-break pass, which runs on its own headroom.
+/// `depth` is the last completed iteration or noisy pass, or 0 if none completed,
 /// since an incomplete depth is discarded rather than "reached". A caller comparing these
 /// against the budget it handed in can tell a work-bound search from a time-bound one.
 #[derive(Clone, Copy, Debug, Default)]

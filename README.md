@@ -88,8 +88,8 @@ The UCI binary accepts these options with `setoption name <name> value <value>`:
 
 Settings survive `ucinewgame`. With noise enabled, the engine takes an immediate win
 and avoids moves that allow an immediate loss when a safe move exists, checking every
-possible flip reveal. It scores all root moves at `NoiseDepth`, without a node or time
-cutoff. With `Noise` set to zero, the usual node and time limits apply.
+possible flip reveal.
+The noisy pass deepens one ply at a time up to `NoiseDepth` and stops at the node or time limit, using the deepest pass that finished.
 
 ## Layout
 
