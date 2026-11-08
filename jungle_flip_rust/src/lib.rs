@@ -1,8 +1,8 @@
 //! Flip Jungle endgame tablebases + (with the `pyext` feature, default) PyO3 bindings.
 //!
-//! The tablebase builder (`flatdb`, `game`) is pure Rust and also drives the standalone
-//! `build_tb` binary (`--no-default-features`, no Python). The PyO3 surface — engine
-//! search, parity hooks, HashMap DB — lives behind the `pyext` feature.
+//! The search and tablebase modules are pure Rust, available without Python. The
+//! standalone `build_tb` binary also builds with `--no-default-features`. Only the
+//! Python bindings live behind the `pyext` feature.
 //!
 //! Square encoding across the boundary matches the Python reference `endgame.poskey`:
 //! a length-16 list of i8, -1 empty else color*8+role. `result`/`value` return
@@ -11,10 +11,8 @@
 pub mod flatdb;
 pub mod game;
 
-#[cfg(feature = "pyext")]
-mod endgame;
-#[cfg(feature = "pyext")]
-mod engine;
+pub mod endgame;
+pub mod engine;
 
 #[cfg(feature = "pyext")]
 mod pyext {

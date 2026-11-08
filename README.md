@@ -76,6 +76,21 @@ the box. Set `JF_TIE_SEED` to pin it:
 - `JF_TIE_SEED=<nonzero>` — reproducible variety: the same seed always yields the same game, a
   different seed a different one. Generate and log one per game to get variety and exact replay.
 
+## Weaker play
+
+The UCI binary accepts these options with `setoption name <name> value <value>`:
+
+| Option | Default | Values and behavior |
+| --- | --- | --- |
+| `Noise` | `0` | Finite, nonnegative Gaussian standard deviation in the engine's [-1, 1] score units. Fractional values are accepted. Zero keeps the normal search; larger values make weaker choices. |
+| `NoiseDepth` | `1` | Integer from 1 to 8. Scores each root move at this depth before adding noise. Higher depths search more replies. |
+| `Seed` | `0` | Unsigned 64-bit integer. A nonzero value makes choices reproducible for the same position and settings. Zero uses fresh noise entropy and keeps the `JF_TIE_SEED` policy for exact ties. |
+
+Settings survive `ucinewgame`. With noise enabled, the engine takes an immediate win
+and avoids moves that allow an immediate loss when a safe move exists, checking every
+possible flip reveal. It scores all root moves at `NoiseDepth`, without a node or time
+cutoff. With `Noise` set to zero, the usual node and time limits apply.
+
 ## Layout
 
 - `jungle_flip_rust/`: the engine core and PyO3 bindings.

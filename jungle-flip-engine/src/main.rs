@@ -121,7 +121,7 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::time::{Duration, Instant};
 
-const ENGINE_NAME: &str = "MistyJungleFlip 0.5.2";
+const ENGINE_NAME: &str = "MistyJungleFlip 0.5.3";
 /// Node budget for a `go` that names neither limit. Deliberately NOT a time budget: a bare
 /// `go` is the reproducible path the golden vectors depend on, and a wall clock would make it
 /// host-dependent.
@@ -222,6 +222,10 @@ fn tie_base_seed() -> u64 {
     if let Ok(s) = std::env::var("JF_TIE_SEED") {
         return s.parse::<u64>().unwrap_or(0);
     }
+    entropy_seed()
+}
+
+fn entropy_seed() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -274,6 +278,7 @@ fn parse_go_limits(line: &str) -> (u64, Option<u64>) {
     (budget, movetime)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn search_best(
     p: &Parsed,
@@ -283,6 +288,24 @@ fn search_best(
     db: Option<engine::DbRef>,
     db_max: usize,
     base_seed: u64,
+) -> (String, i64, engine::SearchStats) {
+    search_best_with_play(
+        p, node_budget, deadline, rep_seed, db, db_max, base_seed,
+        &engine::PlayOptions::default(), &mut engine::PlayRng::new(base_seed),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_best_with_play(
+    p: &Parsed,
+    node_budget: u64,
+    deadline: Option<Instant>,
+    rep_seed: &[u64],
+    db: Option<engine::DbRef>,
+    db_max: usize,
+    base_seed: u64,
+    play: &engine::PlayOptions,
+    rng: &mut engine::PlayRng,
 ) -> (String, i64, engine::SearchStats) {
     let st = state_of(p);
     // Tie-break: exact-value ties among root moves (e.g. the opening flip, where all 16
@@ -296,7 +319,7 @@ fn search_best(
         let mixed = base_seed ^ st.rep_key();
         if mixed == 0 { base_seed } else { mixed }
     };
-    let ((frm, to), score, stats) = engine::best_move_scored_stats(
+    let ((frm, to), score, stats) = engine::select_move_scored_stats(
         &st,
         node_budget,
         deadline,
@@ -311,6 +334,8 @@ fn search_best(
         WIN_DIST,
         rep_seed,
         rng_seed,
+        play,
+        rng,
     );
     if frm == 255 {
         ("(none)".to_string(), 0, stats)
@@ -331,6 +356,48 @@ fn parse_rep_seed(reps: &str) -> Vec<u64> {
         .collect()
 }
 
+/// Noise is a string UCI option because sigma is fractional; Seed supports u64.
+/// Reject invalid values without changing the previous setting.
+fn set_play_option(line: &str, play: &mut engine::PlayOptions, seed: &mut u64) -> bool {
+    let tokens: Vec<_> = line.split_whitespace().collect();
+    if tokens.len() != 5 || tokens[1] != "name" || tokens[3] != "value" {
+        return false;
+    }
+    match tokens[2] {
+        "Noise" => {
+            let Ok(noise) = tokens[4].parse() else {
+                return false;
+            };
+            let candidate = engine::PlayOptions { noise, ..*play };
+            if candidate.validate().is_err() {
+                return false;
+            }
+            *play = candidate;
+        }
+        "NoiseDepth" => {
+            let Ok(noise_depth) = tokens[4].parse::<i32>() else {
+                return false;
+            };
+            let candidate = engine::PlayOptions {
+                noise_depth,
+                ..*play
+            };
+            if noise_depth < 1 || candidate.validate().is_err() {
+                return false;
+            }
+            *play = candidate;
+        }
+        "Seed" => {
+            let Ok(value) = tokens[4].parse() else {
+                return false;
+            };
+            *seed = value;
+        }
+        _ => return false,
+    }
+    true
+}
+
 fn main() {
     // Resolve the exact-tablebase search leaf once at startup (prebuilt flat artifact
     // preferred; ≤2 in-process fallback). See DB_FALLBACK_PIECES / WIN_DIST.
@@ -338,6 +405,8 @@ fn main() {
     let stdin = io::stdin();
     let mut current: Option<Parsed> = None;
     let mut current_reps: Vec<u64> = Vec::new();
+    let mut play = engine::PlayOptions::default();
+    let mut seed = 0;
     for line in stdin.lock().lines() {
         let line = match line {
             Ok(l) => l,
@@ -349,7 +418,15 @@ fn main() {
             "uci" => {
                 println!("id name {ENGINE_NAME}");
                 println!("id author Mistboard");
+                println!("option name Noise type string default 0");
+                println!("option name NoiseDepth type spin default 1 min 1 max 8");
+                println!("option name Seed type string default 0");
                 println!("uciok");
+            }
+            "setoption" => {
+                if !set_play_option(line, &mut play, &mut seed) {
+                    println!("info string invalid or unknown option");
+                }
             }
             "isready" => println!("readyok"),
             "ucinewgame" => {
@@ -377,7 +454,15 @@ fn main() {
                 let deadline = movetime.map(|ms| started + Duration::from_millis(ms));
                 match &current {
                     Some(p) => {
-                        let (uci, cp, stats) = search_best(p, budget, deadline, &current_reps, db.as_ref().map(LeafDb::as_ref), db_max, tie_base_seed());
+                        // Seed=0 keeps the existing JF_TIE_SEED/entropy policy for ties.
+                        let base = if seed == 0 { tie_base_seed() } else { seed };
+                        let random_base = if seed == 0 { entropy_seed() } else { seed };
+                        let position_seed = random_base ^ state_of(p).rep_key();
+                        let (uci, cp, stats) = search_best_with_play(
+                            p, budget, deadline, &current_reps,
+                            db.as_ref().map(LeafDb::as_ref), db_max, base, &play,
+                            &mut engine::PlayRng::new(position_seed),
+                        );
                         let elapsed_ms = started.elapsed().as_millis() as u64;
                         if uci == "(none)" {
                             println!("bestmove (none)");
@@ -403,6 +488,60 @@ fn main() {
 #[cfg(test)]
 mod fen_tests {
     use super::*;
+
+    #[test]
+    fn play_options_accept_source_ranges_and_preserve_settings_on_invalid_input() {
+        let mut play = engine::PlayOptions::default();
+        let mut seed = 0;
+        assert_eq!(play.noise, 0.);
+        for (name, good, bad) in [
+            ("Noise", "0.15", vec!["-1", "NaN", "inf", "text"]),
+            ("NoiseDepth", "8", vec!["0", "9", "-1", "1.5"]),
+            (
+                "Seed",
+                "18446744073709551615",
+                vec!["-1", "18446744073709551616", "1.5"],
+            ),
+        ] {
+            assert!(set_play_option(
+                &format!("setoption name {name} value {good}"),
+                &mut play,
+                &mut seed,
+            ));
+            let previous = (play.noise, play.noise_depth, seed);
+            for value in bad {
+                assert!(!set_play_option(
+                    &format!("setoption name {name} value {value}"),
+                    &mut play,
+                    &mut seed,
+                ));
+                assert_eq!((play.noise, play.noise_depth, seed), previous);
+            }
+        }
+        for line in [
+            "setoption",
+            "setoption name Noise",
+            "setoption name Mix value 1",
+        ] {
+            assert!(!set_play_option(line, &mut play, &mut seed));
+        }
+        assert!(set_play_option(
+            "setoption name Noise value 0",
+            &mut play,
+            &mut seed
+        ));
+        assert!(set_play_option(
+            "setoption name NoiseDepth value 1",
+            &mut play,
+            &mut seed
+        ));
+        assert!(set_play_option(
+            "setoption name Seed value 0",
+            &mut play,
+            &mut seed
+        ));
+        assert_eq!((play.noise, play.noise_depth, seed), (0., 1, 0));
+    }
 
     fn down(p: &Parsed) -> u32 {
         p.squares.iter().filter(|&&c| c == engine::DOWN).count() as u32

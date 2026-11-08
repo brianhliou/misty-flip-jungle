@@ -381,6 +381,365 @@ impl<'a> DbRef<'a> {
     }
 }
 
+/// Weak-play settings. Sigma is a standard deviation in native [-1,1] utility
+/// units, NOT centipawns. Zero settings delegate directly to the legacy search.
+pub const MAX_NOISE_DEPTH: i32 = 8;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlayOptions {
+    pub noise: f64,
+    pub mix: f64,
+    /// Root scoring depth for noise (0 or 1 = depth 1; each extra ply searches
+    /// one more ply below every root move).
+    pub noise_depth: i32,
+}
+
+impl PlayOptions {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !self.noise.is_finite() || self.noise < 0. {
+            return Err("noise must be finite and nonnegative");
+        }
+        if !self.mix.is_finite() || !(0. ..=1.).contains(&self.mix) {
+            return Err("mix must be a finite probability in 0..1");
+        }
+        if !(0..=MAX_NOISE_DEPTH).contains(&self.noise_depth) {
+            return Err("noise depth must be 0..8");
+        }
+        Ok(())
+    }
+}
+
+/// Separate streams keep mix decisions, random moves, and Gaussian samples from
+/// perturbing each other. A seed of zero is deterministic here; entropy is a UCI
+/// caller policy.
+#[derive(Clone, Debug)]
+pub struct PlayRng {
+    moves: u64,
+    mix: u64,
+    noise: u64,
+}
+
+impl PlayRng {
+    pub fn new(seed: u64) -> Self {
+        Self {
+            moves: seed ^ 0x94d049bb133111eb,
+            mix: seed ^ 0xbf58476d1ce4e5b9,
+            noise: seed ^ 0x369dea0f31a53f85,
+        }
+    }
+    fn next(state: &mut u64) -> u64 {
+        let result = splitmix64(*state);
+        *state = state.wrapping_add(0x9e3779b97f4a7c15);
+        result
+    }
+    fn uniform(state: &mut u64) -> f64 {
+        (Self::next(state) >> 11) as f64 / (1u64 << 53) as f64
+    }
+    fn index(&mut self, n: usize) -> usize {
+        let n = n as u64;
+        let limit = n.wrapping_neg() % n;
+        loop {
+            let x = Self::next(&mut self.moves);
+            if x >= limit {
+                return (x % n) as usize;
+            }
+        }
+    }
+    fn gaussian(&mut self) -> f64 {
+        // Box-Muller; 1-U is in (0,1], so ln(0) is impossible.
+        let u = 1. - Self::uniform(&mut self.noise);
+        let angle = std::f64::consts::TAU * Self::uniform(&mut self.noise);
+        (-2. * u.ln()).sqrt() * angle.cos()
+    }
+}
+
+fn move_children(st: &State, m: (u8, u8)) -> Vec<State> {
+    let reveals = if m.0 == m.1 {
+        st.flip_outcomes().0.into_iter().map(|(c, _)| c).collect()
+    } else {
+        vec![-1]
+    };
+    reveals
+        .into_iter()
+        .map(|reveal| {
+            let mut child = st.clone();
+            child.push(m.0 as usize, m.1 as usize, reveal);
+            child
+        })
+        .collect()
+}
+
+fn mover_wins(st: &State, child: &State) -> bool {
+    // Before the first flip, its ink binds to the moving seat.
+    let mover = if st.mover_color() < 0 {
+        child.first_color
+    } else {
+        st.mover_color()
+    };
+    child.result() == mover
+}
+
+/// Guaranteed win in one. A flip must win for EVERY possible public reveal.
+fn wins_in_one(st: &State, m: (u8, u8)) -> bool {
+    let children = move_children(st, m);
+    !children.is_empty() && children.iter().all(|child| mover_wins(st, child))
+}
+
+fn unsafe_in_one(st: &State, m: (u8, u8)) -> bool {
+    move_children(st, m).iter().any(|child| {
+        let result = child.result();
+        if result != RES_ONGOING {
+            return result != RES_DRAW && !mover_wins(st, child);
+        }
+        let opponent = child.mover_color();
+        let mut replies = Vec::new();
+        child.legal_moves(&mut replies);
+        replies.into_iter().any(|reply| {
+            // Conservatively include winning chance outcomes of an opponent flip.
+            move_children(child, reply)
+                .iter()
+                .any(|s| s.result() == opponent)
+        })
+    })
+}
+
+/// Guarded legal root set, using only public state. Immediate wins take priority;
+/// if every legal move loses in one, retain them all rather than return no move.
+pub fn guarded_root_moves(st: &State) -> Vec<(u8, u8)> {
+    let mut legal = Vec::new();
+    st.legal_moves(&mut legal);
+    let wins: Vec<_> = legal
+        .iter()
+        .copied()
+        .filter(|&m| wins_in_one(st, m))
+        .collect();
+    if !wins.is_empty() {
+        return wins;
+    }
+    let safe: Vec<_> = legal
+        .iter()
+        .copied()
+        .filter(|&m| !unsafe_in_one(st, m))
+        .collect();
+    if safe.is_empty() {
+        legal
+    } else {
+        safe
+    }
+}
+
+/// Guarded weak-play selection. Noise uses a FIXED-depth (noise_depth) full-window root pass
+/// with the normal 8-ply capture quiescence, classical evaluation, tablebases, history and Star1 reveals.
+/// Every legal move is scored, with no partial-pass bias or node/deadline abort;
+/// noisy play's work limit is this shallow horizon, not the pure-search budget.
+/// Mix is sampled after the guards; even its search branch cannot pick an unsafe
+/// move. Disabled settings do no guard work and consume no random numbers.
+#[allow(clippy::too_many_arguments)]
+pub fn select_move_scored_stats(
+    st: &State,
+    node_budget: u64,
+    deadline: Option<Instant>,
+    contempt: f64,
+    w_mob: f64,
+    values: [f64; 8],
+    max_depth: i32,
+    db: Option<DbRef>,
+    db_max: usize,
+    dom_term: bool,
+    rep_detect: bool,
+    win_dist: bool,
+    rep_seed: &[u64],
+    rng_seed: u64,
+    play: &PlayOptions,
+    rng: &mut PlayRng,
+) -> ((u8, u8), f64, SearchStats) {
+    play.validate().expect("invalid PlayOptions");
+    if play.noise == 0. && play.mix == 0. {
+        return best_move_scored_stats(
+            st,
+            node_budget,
+            deadline,
+            contempt,
+            w_mob,
+            values,
+            max_depth,
+            db,
+            db_max,
+            dom_term,
+            rep_detect,
+            win_dist,
+            rep_seed,
+            rng_seed,
+        );
+    }
+    let allowed = guarded_root_moves(st);
+    let report = |best_move, value| (best_move, value, SearchStats::default());
+    if allowed.is_empty() {
+        return report((255, 255), 0.);
+    }
+    if wins_in_one(st, allowed[0]) {
+        return report(allowed[0], 1.);
+    }
+    if play.mix == 1. || (play.mix > 0. && PlayRng::uniform(&mut rng.mix) < play.mix) {
+        return report(allowed[rng.index(allowed.len())], 0.);
+    }
+    if play.noise == 0. {
+        return best_move_filtered(
+            st,
+            node_budget,
+            deadline,
+            contempt,
+            w_mob,
+            values,
+            max_depth,
+            db,
+            db_max,
+            dom_term,
+            rep_detect,
+            win_dist,
+            rep_seed,
+            rng_seed,
+            Some(&allowed),
+        );
+    }
+    let cfg = Cfg {
+        w_mob,
+        values,
+        contempt,
+        root: st.mover_color(),
+        quiesce: true,
+        quiesce_max: 8,
+        db,
+        db_max,
+        dom_term,
+        rep_detect,
+        win_dist,
+        root_ply: st.ply,
+        rep_seed,
+        order_heur: std::env::var("JF_NO_ORDER_HEUR").is_err(),
+    };
+    noisy_root_choice(st, &cfg, &allowed, play.noise, play.noise_depth.max(1), rng)
+}
+
+fn noisy_root_choice(
+    st: &State,
+    cfg: &Cfg,
+    allowed: &[(u8, u8)],
+    sigma: f64,
+    depth: i32,
+    rng: &mut PlayRng,
+) -> ((u8, u8), f64, SearchStats) {
+    let mut ctx = Ctx::new(u64::MAX, None);
+    if cfg.rep_detect {
+        ctx.path.push(st.rep_key());
+        ctx.path.extend_from_slice(cfg.rep_seed);
+    }
+    let moves = ordered_moves(st, &cfg.values, None, &ctx.killers[1], &ctx.history);
+    let (mut best, mut value, mut noisy_best) = (allowed[0], 0., -INF);
+    for m in moves {
+        let v = move_value(st, m, depth, VMIN, VMAX, cfg, &mut ctx).expect("uncapped root pass");
+        // Compare in sigma-normalized space to avoid overflow for finite huge sigma.
+        let z = rng.gaussian();
+        let noisy = if sigma >= 1. {
+            v / sigma + z
+        } else {
+            v + sigma * z
+        };
+        if allowed.contains(&m) && noisy > noisy_best {
+            best = m;
+            value = v;
+            noisy_best = noisy;
+        }
+    }
+    (
+        best,
+        value,
+        SearchStats {
+            depth,
+            nodes: ctx.nodes,
+        },
+    )
+}
+
+#[cfg(test)]
+mod weak_play_tests {
+    use super::*;
+
+    #[test]
+    fn gaussian_is_replayable_centered_and_unit_variance() {
+        let (mut a, mut b) = (PlayRng::new(123), PlayRng::new(123));
+        let (mut sum, mut squares) = (0., 0.);
+        for _ in 0..10_000 {
+            let z = a.gaussian();
+            assert_eq!(z, b.gaussian());
+            sum += z;
+            squares += z * z;
+        }
+        assert!((sum / 10_000.).abs() < 0.04);
+        assert!((squares / 10_000. - 1.).abs() < 0.06);
+    }
+
+    #[test]
+    fn guard_rescues_a_win_that_unguarded_noise_would_skip() {
+        let st = State {
+            sq: [
+                1, 8, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY,
+                EMPTY, EMPTY, EMPTY,
+            ],
+            bag: [0; 16],
+            first_color: 0,
+            ply: 0,
+            no_progress: 0,
+        };
+        let cfg = Cfg {
+            w_mob: 0.8,
+            values: [6., 2., 3., 4., 5., 7., 8., 10.],
+            contempt: 0.05,
+            root: 0,
+            quiesce: true,
+            quiesce_max: 8,
+            db: None,
+            db_max: 0,
+            dom_term: false,
+            rep_detect: true,
+            win_dist: true,
+            root_ply: 0,
+            rep_seed: &[],
+            order_heur: true,
+        };
+        let mut legal = Vec::new();
+        st.legal_moves(&mut legal);
+        let seed = (0..64)
+            .find(|&seed| {
+                noisy_root_choice(&st, &cfg, &legal, 100., 1, &mut PlayRng::new(seed)).0 != (0, 1)
+            })
+            .expect("large noise must sometimes miss the win without guards");
+        let guarded = select_move_scored_stats(
+            &st,
+            100,
+            None,
+            cfg.contempt,
+            cfg.w_mob,
+            cfg.values,
+            24,
+            None,
+            0,
+            false,
+            true,
+            true,
+            &[],
+            seed,
+            &PlayOptions {
+                noise: 100.,
+                mix: 0.,
+                ..Default::default()
+            },
+            &mut PlayRng::new(seed),
+        );
+        assert_eq!(guarded.0, (0, 1));
+    }
+}
+
 pub struct Cfg<'a> {
     pub w_mob: f64,
     pub values: [f64; 8],
@@ -874,11 +1233,11 @@ pub fn search_nodes(st: &State, depth: i32, w_mob: f64, values: [f64; 8]) -> u64
         order_heur: std::env::var("JF_NO_ORDER_HEUR").is_err(),
     };
     let mut ctx = Ctx::new(u64::MAX, None);
-    let _ = best_at_depth(st, depth, &cfg, &mut ctx, None);
+    let _ = best_at_depth(st, depth, &cfg, &mut ctx, None, None);
     ctx.nodes
 }
 
-fn best_at_depth(st: &State, depth: i32, cfg: &Cfg, ctx: &mut Ctx, hint: Option<(u8, u8)>) -> Result<(Option<(u8, u8)>, f64), ()> {
+fn best_at_depth(st: &State, depth: i32, cfg: &Cfg, ctx: &mut Ctx, hint: Option<(u8, u8)>, allowed: Option<&[(u8, u8)]>) -> Result<(Option<(u8, u8)>, f64), ()> {
     let kdi = (depth as usize).min(ctx.killers.len() - 1);
     let killers_d = ctx.killers[kdi];
     let moves = ordered_moves(st, &cfg.values, hint, &killers_d, &ctx.history);
@@ -891,7 +1250,7 @@ fn best_at_depth(st: &State, depth: i32, cfg: &Cfg, ctx: &mut Ctx, hint: Option<
         // Game-history positions already seen twice: re-entering one is the threefold draw.
         ctx.path.extend_from_slice(cfg.rep_seed);
     }
-    for m in moves {
+    for m in moves.into_iter().filter(|m| allowed.is_none_or(|a| a.contains(m))) {
         let v = move_value(st, m, depth, alpha, VMAX, cfg, ctx)?;
         if v > best_val {
             best_val = v;
@@ -926,7 +1285,7 @@ pub fn search_eval(
     let mut val = 0.0;
     let mut hint = None;
     for depth in 1..=max_depth {
-        match best_at_depth(st, depth, &cfg, &mut ctx, hint) {
+        match best_at_depth(st, depth, &cfg, &mut ctx, hint, None) {
             Ok((Some(m), v)) => {
                 val = v;
                 hint = Some(m);
@@ -957,7 +1316,7 @@ fn splitmix64(x: u64) -> u64 {
 /// headroom past a deadline the caller is waiting on is exactly the overshoot to avoid.
 #[allow(clippy::float_cmp)] // exact equality is intentional: only bit-identical evals tie
 fn root_ties_at_depth(
-    st: &State, depth: i32, cfg: &Cfg, ctx: &mut Ctx, hint: Option<(u8, u8)>, primary: (u8, u8),
+    st: &State, depth: i32, cfg: &Cfg, ctx: &mut Ctx, hint: Option<(u8, u8)>, primary: (u8, u8), allowed: Option<&[(u8, u8)]>,
 ) -> Vec<(u8, u8)> {
     let kdi = (depth as usize).min(ctx.killers.len() - 1);
     let killers_d = ctx.killers[kdi];
@@ -970,7 +1329,7 @@ fn root_ties_at_depth(
     ctx.nodes = 0; // headroom for the post-search pass (mostly TT hits)
     let mut best = -INF;
     let mut ties: Vec<(u8, u8)> = Vec::new();
-    for m in moves {
+    for m in moves.into_iter().filter(|m| allowed.is_none_or(|a| a.contains(m))) {
         match move_value(st, m, depth, VMIN, VMAX, cfg, ctx) {
             Ok(v) => {
                 if v > best {
@@ -1008,9 +1367,9 @@ pub fn best_move(
 }
 
 /// What a search actually CONSUMED, as opposed to what it was allowed. `nodes` is the real
-/// visited-node count of the strength-determining iterative deepening (never the budget echoed
-/// back, and never including the post-search tie-break pass, which runs on its own headroom).
-/// `depth` is the last iteration that ran to COMPLETION — 0 if even the first was cut short,
+/// visited-node count of iterative deepening or the fixed-depth noisy pass. It excludes the
+/// post-search tie-break pass, which runs on its own headroom.
+/// `depth` is the last completed iteration or fixed-depth pass, or 0 if none completed,
 /// since an incomplete depth is discarded rather than "reached". A caller comparing these
 /// against the budget it handed in can tell a work-bound search from a time-bound one.
 #[derive(Clone, Copy, Debug, Default)]
@@ -1052,6 +1411,19 @@ pub fn best_move_scored_stats(
     db: Option<DbRef>, db_max: usize, dom_term: bool, rep_detect: bool, win_dist: bool,
     rep_seed: &[u64], rng_seed: u64,
 ) -> ((u8, u8), f64, SearchStats) {
+    best_move_filtered(
+        st, node_budget, deadline, contempt, w_mob, values, max_depth, db, db_max,
+        dom_term, rep_detect, win_dist, rep_seed, rng_seed, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn best_move_filtered(
+    st: &State, node_budget: u64, deadline: Option<Instant>, contempt: f64, w_mob: f64,
+    values: [f64; 8], max_depth: i32,
+    db: Option<DbRef>, db_max: usize, dom_term: bool, rep_detect: bool, win_dist: bool,
+    rep_seed: &[u64], rng_seed: u64, allowed: Option<&[(u8, u8)]>,
+) -> ((u8, u8), f64, SearchStats) {
     let cfg = Cfg {
         w_mob, values, contempt, root: st.mover_color(),
         quiesce: true, quiesce_max: 8, db, db_max, dom_term, rep_detect,
@@ -1060,6 +1432,7 @@ pub fn best_move_scored_stats(
     };
     let mut mv: Vec<(u8, u8)> = Vec::new();
     st.legal_moves(&mut mv);
+    if let Some(allowed) = allowed { mv.retain(|m| allowed.contains(m)); }
     if mv.is_empty() {
         return ((255, 255), 0.0, SearchStats::default());
     }
@@ -1069,7 +1442,7 @@ pub fn best_move_scored_stats(
     let mut hint = None;
     let mut last_depth = 0;
     for depth in 1..=max_depth {
-        match best_at_depth(st, depth, &cfg, &mut ctx, hint) {
+        match best_at_depth(st, depth, &cfg, &mut ctx, hint, allowed) {
             Ok((Some(m), v)) => {
                 best = m;
                 best_score = v;
@@ -1093,7 +1466,7 @@ pub fn best_move_scored_stats(
         return (best, best_score, stats);
     }
     // Break exact ties among equal-best root moves. `best` is always in the tie set.
-    let ties = root_ties_at_depth(st, last_depth, &cfg, &mut ctx, Some(best), best);
+    let ties = root_ties_at_depth(st, last_depth, &cfg, &mut ctx, Some(best), best, allowed);
     if ties.len() <= 1 {
         return (best, best_score, stats);
     }
