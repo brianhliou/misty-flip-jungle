@@ -8,8 +8,10 @@
 //! Parallelizes over all CPU cores (rayon). Memory ≈ 2 × (level_size/4) bytes for the top
 //! level (≈24 GB at k=6). Load the artifact back with `flatdb::FlatDB::load`.
 
+#[allow(dead_code)] // The builder uses only the revealed-board primitives.
 #[path = "../game.rs"]
 mod game;
+#[allow(dead_code)] // The builder does not load or probe artifacts.
 #[path = "../flatdb.rs"]
 mod flatdb;
 

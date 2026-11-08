@@ -26,8 +26,8 @@ fn unpack(key: u128) -> ([i8; NSQ], i8) {
     let stm = (key & 1) as i8;
     let mut rest = key >> 1;
     let mut board = [EMPTY; NSQ];
-    for i in 0..NSQ {
-        board[i] = ((rest & 31) as i8) - 1;
+    for square in &mut board {
+        *square = ((rest & 31) as i8) - 1;
         rest >>= 5;
     }
     (board, stm)
@@ -101,6 +101,7 @@ fn placements(pick: &[i8], mut f: impl FnMut(&[i8; NSQ], i8)) {
 /// Build the tablebase up to `max_pieces`. Returns `(db, per_level_stats)` where each
 /// entry is `(wld, dtm)` — dtm in plies (0 for draws) — and stats is
 /// `[(n, wins, losses, draws); per level]`.
+#[allow(clippy::type_complexity)] // Existing public tablebase/statistics API.
 pub fn build(max_pieces: usize) -> (HashMap<u128, (i8, u16)>, Vec<(usize, usize, usize, usize)>) {
     let codes = all_codes();
     let mut db: HashMap<u128, (i8, u16)> = HashMap::new();

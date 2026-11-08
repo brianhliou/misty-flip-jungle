@@ -7,3 +7,6 @@ dist/
 wheels/
 .venv/
 *.bin
+
+# External neural evaluation files (never bundled).
+*.jfnn

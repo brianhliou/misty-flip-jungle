@@ -1,6 +1,6 @@
 [package]
 name = "jungle_flip_rust"
-version = "0.1.0"
+version = "0.6.0"
 edition = "2021"
 description = "A Flip Jungle (翻翻棋, hidden-identity animal chess) engine in Rust: αβ + Star1 chance-node search and exact endgame tablebases."
 license = "MIT"
@@ -20,6 +20,9 @@ path = "src/bin/build_tb.rs"
 pyo3 = { version = "0.29", features = ["extension-module"], optional = true }
 rayon = "1"
 
+[build-dependencies]
+pyo3-build-config = { version = "0.29", optional = true }
+
 [features]
 default = ["pyext"]
-pyext = ["dep:pyo3"]
+pyext = ["dep:pyo3", "dep:pyo3-build-config"]

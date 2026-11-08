@@ -1,8 +1,10 @@
 //! Masked-state Flip Jungle model — the playing engine's game model (face-down tiles
 //! + bag + flips as chance nodes). Distinct from `game.rs` (fully-revealed, tablebase).
+//!
 //! The αβ + Star1 chance-node search builds on this (added next).
 //!
 //! Square encoding (across the PyO3 boundary): i16 per square, -1 empty, -2 face-down,
+//!
 //! else 0..15 = color*8 + role (color 0=red,1=black; role 0..7 = rat..elephant, so role
 //! IS rank-1). bag: [u32;16] indexed by piece code. first_color: -1 unbound / 0 / 1.
 
@@ -41,7 +43,7 @@ fn sqi(f: i32, r: i32) -> usize {
 }
 #[inline]
 fn in_bounds(f: i32, r: i32) -> bool {
-    f >= 0 && f < W && r >= 0 && r < H
+    (0..W).contains(&f) && (0..H).contains(&r)
 }
 
 /// Capture resolution by ROLE: 0 = blocked, 1 = capture (advance), 2 = 同归于尽 trade.
@@ -76,7 +78,7 @@ impl State {
         if self.first_color < 0 {
             return -1;
         }
-        if self.ply % 2 == 0 {
+        if self.ply.is_multiple_of(2) {
             self.first_color
         } else {
             1 - self.first_color
@@ -228,7 +230,7 @@ impl State {
     /// face-down bag (it will eventually appear). The bag is color-keyed, so this is exact.
     #[inline]
     fn code_in_play(&self, code: i16) -> bool {
-        self.bag[code as usize] > 0 || self.sq.iter().any(|&c| c == code)
+        self.bag[code as usize] > 0 || self.sq.contains(&code)
     }
 
     fn material(&self, persp: i16, values: &[f64; 8], dom_term: bool) -> f64 {
@@ -335,9 +337,9 @@ const DB_MARGIN: f64 = 0.05;
 /// `1.0 − DIST_SLOPE·min(D, DIST_CAP)`, losses mirrored (prefer longer losses), whether
 /// the line ends at a true terminal (D = plies searched) or a DB leaf (D = plies searched
 /// + DTM). Shorter wins strictly outrank longer ones, which is what converts won endgames
-/// instead of shuffling to the repetition draw (the WLD-no-distance dawdle class). Wins
-/// live in [1−slope·cap, 1] = [0.90, 1.0]; the heuristic eval is clamped to ±EVAL_CLAMP
-/// so the bands never overlap (raw tanh eval can reach ±0.97 on extreme material).
+///   instead of shuffling to the repetition draw (the WLD-no-distance dawdle class). Wins
+///   live in [1−slope·cap, 1] = [0.90, 1.0]; the heuristic eval is clamped to ±EVAL_CLAMP
+///   so the bands never overlap (raw tanh eval can reach ±0.97 on extreme material).
 const DIST_SLOPE: f64 = 0.001;
 const DIST_CAP: f64 = 100.0;
 const EVAL_CLAMP: f64 = 0.85;
@@ -553,9 +555,35 @@ pub fn select_move_scored_stats(
     play: &PlayOptions,
     rng: &mut PlayRng,
 ) -> ((u8, u8), f64, SearchStats) {
+    select_move_with_evaluator(st, node_budget, deadline, contempt, w_mob, values,
+        max_depth, db, db_max, dom_term, rep_detect, win_dist, rep_seed, rng_seed,
+        play, rng, None)
+}
+
+/// Select with an optional public-state leaf evaluator; all search policy is shared.
+#[allow(clippy::too_many_arguments)]
+pub fn select_move_with_evaluator(
+    st: &State,
+    node_budget: u64,
+    deadline: Option<Instant>,
+    contempt: f64,
+    w_mob: f64,
+    values: [f64; 8],
+    max_depth: i32,
+    db: Option<DbRef>,
+    db_max: usize,
+    dom_term: bool,
+    rep_detect: bool,
+    win_dist: bool,
+    rep_seed: &[u64],
+    rng_seed: u64,
+    play: &PlayOptions,
+    rng: &mut PlayRng,
+    evaluator: Option<&dyn LeafEvaluator>,
+) -> ((u8, u8), f64, SearchStats) {
     play.validate().expect("invalid PlayOptions");
     if play.noise == 0. && play.mix == 0. {
-        return best_move_scored_stats(
+        return best_move_filtered(
             st,
             node_budget,
             deadline,
@@ -570,6 +598,8 @@ pub fn select_move_scored_stats(
             win_dist,
             rep_seed,
             rng_seed,
+            None,
+            evaluator,
         );
     }
     let allowed = guarded_root_moves(st);
@@ -600,6 +630,7 @@ pub fn select_move_scored_stats(
             rep_seed,
             rng_seed,
             Some(&allowed),
+            evaluator,
         );
     }
     let cfg = Cfg {
@@ -617,6 +648,7 @@ pub fn select_move_scored_stats(
         root_ply: st.ply,
         rep_seed,
         order_heur: std::env::var("JF_NO_ORDER_HEUR").is_err(),
+        evaluator,
     };
     noisy_root_choice(
         st,
@@ -642,6 +674,7 @@ fn noisy_root_choice(
     rng: &mut PlayRng,
 ) -> ((u8, u8), f64, SearchStats) {
     let mut ctx = Ctx::new(u64::MAX, None);
+    ctx.incremental = cfg.evaluator.and_then(|e| e.start(st));
     let moves = ordered_moves(st, &cfg.values, None, &ctx.killers[1], &ctx.history);
     // Sample every root, including guarded-out moves, in the original order.
     // Reusing these draws preserves both the chosen move and the RNG stream.
@@ -653,6 +686,7 @@ fn noisy_root_choice(
             // No TT, killers or history survive from a shallower pass, so an
             // unlimited final pass scores exactly like the old fixed-depth pass.
             ctx = Ctx::new(node_budget.saturating_sub(stats.nodes), deadline);
+            ctx.incremental = cfg.evaluator.and_then(|e| e.start(st));
         }
         if cfg.rep_detect {
             ctx.path.push(st.rep_key());
@@ -750,6 +784,7 @@ mod weak_play_tests {
             root_ply: st.ply,
             rep_seed: &[],
             order_heur: true,
+            evaluator: None,
         }
     }
 
@@ -919,6 +954,7 @@ mod weak_play_tests {
             root_ply: 0,
             rep_seed: &[],
             order_heur: true,
+            evaluator: None,
         };
         let mut legal = Vec::new();
         st.legal_moves(&mut legal);
@@ -963,6 +999,27 @@ mod weak_play_tests {
     }
 }
 
+/// Optional leaf evaluator. It receives ONLY the public masked state, never a deal.
+/// Values must be side-to-move utilities in [-1, 1]. Terminals and tablebases
+/// continue to take precedence, and win-distance clamping is unchanged.
+pub trait LeafEvaluator {
+    fn evaluate(&self, state: &State) -> f64;
+    /// Start search-local incremental state, refreshed at the root. Stateless
+    /// evaluators can keep the default; search never shares a session across calls.
+    fn start(&self, _root: &State) -> Option<Box<dyn IncrementalEvaluator + '_>> {
+        None
+    }
+}
+
+/// Search owns one session and brackets every real child (including reveals and
+/// quiescence captures) with push/pop. Pop also runs before propagating a budget
+/// error, so iterative deepening and the root tie pass can reuse the root safely.
+pub trait IncrementalEvaluator {
+    fn evaluate(&self, state: &State) -> f64;
+    fn push(&mut self, child: &State);
+    fn pop(&mut self);
+}
+
 pub struct Cfg<'a> {
     pub w_mob: f64,
     pub values: [f64; 8],
@@ -993,6 +1050,7 @@ pub struct Cfg<'a> {
     /// β-cutoffs, so the search reaches deeper at a fixed node budget). Disable with the
     /// `JF_NO_ORDER_HEUR` env var (for the on/off efficiency A/B).
     pub order_heur: bool,
+    pub evaluator: Option<&'a dyn LeafEvaluator>,
 }
 
 /// Side-to-move-perspective value of a draw, applying root draw contempt.
@@ -1018,13 +1076,13 @@ fn db_probe(st: &State, cfg: &Cfg) -> Option<f64> {
     }
     let mut board = [crate::game::EMPTY; crate::game::NSQ];
     let mut npieces = 0usize;
-    for i in 0..NSQ {
+    for (i, square) in board.iter_mut().enumerate() {
         let c = st.sq[i];
         if c == DOWN {
             return None;
         }
         if is_piece(c) {
-            board[i] = c as i8;
+            *square = c as i8;
             npieces += 1;
         }
     }
@@ -1082,7 +1140,8 @@ fn grade_db(wld: i8, dtm: u16, st: &State, cfg: &Cfg) -> f64 {
 /// slower host samples the clock at the same node spacing and simply reaches fewer nodes.
 const DEADLINE_CHECK_NODES: u32 = 512;
 
-struct Ctx {
+struct Ctx<'a> {
+    incremental: Option<Box<dyn IncrementalEvaluator + 'a>>,
     nodes: u64,
     budget: u64,
     /// Wall-clock stop, or `None` for a purely node-bounded search. `Instant::now()` is called
@@ -1099,9 +1158,10 @@ struct Ctx {
     history: [[u32; NSQ]; NSQ],  // [from][to] -> depth-weighted cutoff count (quiet moves)
 }
 
-impl Ctx {
+impl<'a> Ctx<'a> {
     fn new(budget: u64, deadline: Option<Instant>) -> Self {
         Ctx {
+            incremental: None,
             nodes: 0,
             budget,
             deadline,
@@ -1113,6 +1173,16 @@ impl Ctx {
         }
     }
 
+    fn push_eval(&mut self, child: &State) {
+        if let Some(eval) = &mut self.incremental {
+            eval.push(child);
+        }
+    }
+    fn pop_eval(&mut self) {
+        if let Some(eval) = &mut self.incremental {
+            eval.pop();
+        }
+    }
     /// Charge one node against BOTH limits. Either one being reached is the same `Err(())`
     /// the search has always used for a budget-out: it propagates out through `?`, the
     /// iterative-deepening loop discards the incomplete depth, and the caller keeps the last
@@ -1169,8 +1239,14 @@ fn terminal_value(st: &State, res: i16, cfg: &Cfg) -> f64 {
 /// Heuristic leaf eval, clamped under win_dist so it can never outrank a forced win
 /// (raw tanh eval reaches ±0.97 on extreme material; the win band starts at 0.90).
 #[inline]
-fn leaf_eval(st: &State, cfg: &Cfg) -> f64 {
-    let v = st.eval(st.mover_color(), cfg.w_mob, &cfg.values, cfg.dom_term);
+fn leaf_eval(st: &State, cfg: &Cfg, ctx: &Ctx) -> f64 {
+    let v = ctx.incremental.as_ref().map_or_else(
+        || cfg.evaluator.map_or_else(
+            || st.eval(st.mover_color(), cfg.w_mob, &cfg.values, cfg.dom_term),
+            |eval| eval.evaluate(st),
+        ),
+        |eval| eval.evaluate(st),
+    );
     if cfg.win_dist {
         v.clamp(-EVAL_CLAMP, EVAL_CLAMP)
     } else {
@@ -1225,7 +1301,7 @@ fn quiesce(st: &State, mut alpha: f64, beta: f64, cfg: &Cfg, ctx: &mut Ctx, qdep
     if let Some(v) = db_probe(st, cfg) {
         return Ok(v);
     }
-    let stand = leaf_eval(st, cfg);
+    let stand = leaf_eval(st, cfg, ctx);
     if stand >= beta || qdepth <= 0 {
         return Ok(stand);
     }
@@ -1248,7 +1324,10 @@ fn quiesce(st: &State, mut alpha: f64, beta: f64, cfg: &Cfg, ctx: &mut Ctx, qdep
     for (_, m) in caps {
         let mut child = st.clone();
         child.push(m.0 as usize, m.1 as usize, -1);
-        let v = -quiesce(&child, -beta, -alpha, cfg, ctx, qdepth - 1)?;
+        ctx.push_eval(&child);
+        let result = quiesce(&child, -beta, -alpha, cfg, ctx, qdepth - 1);
+        ctx.pop_eval();
+        let v = -result?;
         if v > best {
             best = v;
         }
@@ -1285,7 +1364,10 @@ fn flip_value(st: &State, m: (u8, u8), depth: i32, alpha: f64, beta: f64, cfg: &
         let cu = if bi < u { bi } else { u };
         let mut child = st.clone();
         child.push(m.0 as usize, m.1 as usize, code);
-        let v = -negamax(&child, depth - 1, -cu, -cl, cfg, ctx)?;
+        ctx.push_eval(&child);
+        let result = negamax(&child, depth - 1, -cu, -cl, cfg, ctx);
+        ctx.pop_eval();
+        let v = -result?;
         if v <= ai {
             return Ok(alpha);
         }
@@ -1303,7 +1385,10 @@ fn move_value(st: &State, m: (u8, u8), depth: i32, alpha: f64, beta: f64, cfg: &
     }
     let mut child = st.clone();
     child.push(m.0 as usize, m.1 as usize, -1);
-    Ok(-negamax(&child, depth - 1, -beta, -alpha, cfg, ctx)?)
+    ctx.push_eval(&child);
+    let result = negamax(&child, depth - 1, -beta, -alpha, cfg, ctx);
+    ctx.pop_eval();
+    Ok(-result?)
 }
 
 fn negamax(st: &State, depth: i32, mut alpha: f64, beta: f64, cfg: &Cfg, ctx: &mut Ctx) -> Result<f64, ()> {
@@ -1318,14 +1403,14 @@ fn negamax(st: &State, depth: i32, mut alpha: f64, beta: f64, cfg: &Cfg, ctx: &m
     }
     // Repetition: a position already on the current line is a forceable cycle ⇒ draw.
     let rk = if cfg.rep_detect { st.rep_key() } else { 0 };
-    if cfg.rep_detect && ctx.path.iter().any(|&k| k == rk) {
+    if cfg.rep_detect && ctx.path.contains(&rk) {
         return Ok(draw_score(st, cfg));
     }
     if depth <= 0 {
         if cfg.quiesce {
             return quiesce(st, alpha, beta, cfg, ctx, cfg.quiesce_max);
         }
-        return Ok(leaf_eval(st, cfg));
+        return Ok(leaf_eval(st, cfg, ctx));
     }
 
     let key = st.zkey();
@@ -1440,6 +1525,7 @@ pub fn search_value(st: &State, depth: i32, w_mob: f64, values: [f64; 8]) -> f64
         quiesce: false, quiesce_max: 0, db: None, db_max: 0, dom_term: false, rep_detect: false,
         win_dist: false, root_ply: st.ply, rep_seed: &[],
         order_heur: false,
+        evaluator: None,
     };
     let mut ctx = Ctx::new(u64::MAX, None);
     negamax(st, depth, VMIN, VMAX, &cfg, &mut ctx).unwrap_or(0.0)
@@ -1454,6 +1540,7 @@ pub fn search_nodes(st: &State, depth: i32, w_mob: f64, values: [f64; 8]) -> u64
         quiesce: true, quiesce_max: 8, db: None, db_max: 0, dom_term: false, rep_detect: false,
         win_dist: false, root_ply: st.ply, rep_seed: &[],
         order_heur: std::env::var("JF_NO_ORDER_HEUR").is_err(),
+        evaluator: None,
     };
     let mut ctx = Ctx::new(u64::MAX, None);
     let _ = best_at_depth(st, depth, &cfg, &mut ctx, None, None);
@@ -1498,6 +1585,7 @@ pub fn search_eval(
         quiesce: true, quiesce_max: 8, db, db_max, dom_term, rep_detect,
         win_dist, root_ply: st.ply, rep_seed: &[],
         order_heur: std::env::var("JF_NO_ORDER_HEUR").is_err(),
+        evaluator: None,
     };
     let mut scratch: Vec<(u8, u8)> = Vec::new();
     let res = st.result_with(&mut scratch);
@@ -1576,7 +1664,6 @@ fn root_ties_at_depth(
 /// deterministic; the caller supplies a per-game/per-move seed for variety.
 /// `rng_seed == 0` is reserved as "off": legacy first-ordered behavior, unchanged.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub fn best_move(
     st: &State, node_budget: u64, contempt: f64, w_mob: f64, values: [f64; 8], max_depth: i32,
     db: Option<DbRef>, db_max: usize, dom_term: bool, rep_detect: bool, win_dist: bool,
@@ -1636,7 +1723,7 @@ pub fn best_move_scored_stats(
 ) -> ((u8, u8), f64, SearchStats) {
     best_move_filtered(
         st, node_budget, deadline, contempt, w_mob, values, max_depth, db, db_max,
-        dom_term, rep_detect, win_dist, rep_seed, rng_seed, None,
+        dom_term, rep_detect, win_dist, rep_seed, rng_seed, None, None,
     )
 }
 
@@ -1646,12 +1733,14 @@ fn best_move_filtered(
     values: [f64; 8], max_depth: i32,
     db: Option<DbRef>, db_max: usize, dom_term: bool, rep_detect: bool, win_dist: bool,
     rep_seed: &[u64], rng_seed: u64, allowed: Option<&[(u8, u8)]>,
+    evaluator: Option<&dyn LeafEvaluator>,
 ) -> ((u8, u8), f64, SearchStats) {
     let cfg = Cfg {
         w_mob, values, contempt, root: st.mover_color(),
         quiesce: true, quiesce_max: 8, db, db_max, dom_term, rep_detect,
         win_dist, root_ply: st.ply, rep_seed,
         order_heur: std::env::var("JF_NO_ORDER_HEUR").is_err(),
+        evaluator,
     };
     let mut mv: Vec<(u8, u8)> = Vec::new();
     st.legal_moves(&mut mv);
@@ -1660,6 +1749,7 @@ fn best_move_filtered(
         return ((255, 255), 0.0, SearchStats::default());
     }
     let mut ctx = Ctx::new(node_budget, deadline);
+    ctx.incremental = evaluator.and_then(|e| e.start(st));
     let mut best = mv[0];
     let mut best_score = 0.0f64;
     let mut hint = None;
@@ -1833,7 +1923,7 @@ pub fn state_from_fen(fen: &str) -> Option<Parsed> {
     let ply: u32 = if parts.len() >= 5 { parts[4].parse().ok()? } else { 0 };
     let first_color: i16 = if mover < 0 {
         -1
-    } else if ply % 2 == 0 {
+    } else if ply.is_multiple_of(2) {
         mover
     } else {
         1 - mover
@@ -1874,7 +1964,7 @@ pub fn fen_from_state(p: &Parsed) -> String {
     }
     let mover = if p.first_color < 0 {
         -1
-    } else if p.ply % 2 == 0 {
+    } else if p.ply.is_multiple_of(2) {
         p.first_color
     } else {
         1 - p.first_color
@@ -1943,6 +2033,7 @@ pub fn root_move_values(
         root_ply: st.ply,
         rep_seed,
         order_heur: true,
+        evaluator: None,
     };
     let mut roots: Vec<(u8, u8)> = Vec::new();
     st.legal_moves(&mut roots);
@@ -2006,7 +2097,7 @@ pub struct RootAnalysisSession {
     rep_detect: bool,
     win_dist: bool,
     rep_seed: Vec<u64>,
-    ctx: Ctx,
+    ctx: Ctx<'static>,
     completed: Vec<(u8, u8, f64)>,
     depth_reached: i32,
     hint: Option<(u8, u8)>,
@@ -2070,6 +2161,7 @@ impl RootAnalysisSession {
             root_ply: self.st.ply,
             rep_seed: &self.rep_seed,
             order_heur: true,
+            evaluator: None,
         };
 
         self.ctx.nodes = 0;

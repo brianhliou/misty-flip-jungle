@@ -13,8 +13,11 @@ pub mod game;
 
 pub mod endgame;
 pub mod engine;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod nnue;
 
-#[cfg(feature = "pyext")]
+// Unit tests exercise the Rust core without linking Python extension exports.
+#[cfg(all(feature = "pyext", not(test)))]
 mod pyext {
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -26,13 +29,11 @@ mod pyext {
 
     fn mk_masked(squares: Vec<i16>, bag: Vec<u32>, first_color: i16, ply: u32, no_progress: u32) -> engine::State {
         let mut sq = [engine::EMPTY; engine::NSQ];
-        for i in 0..engine::NSQ.min(squares.len()) {
-            sq[i] = squares[i];
-        }
+        let n = engine::NSQ.min(squares.len());
+        sq[..n].copy_from_slice(&squares[..n]);
         let mut b = [0u32; 16];
-        for i in 0..16.min(bag.len()) {
-            b[i] = bag[i];
-        }
+        let n = 16.min(bag.len());
+        b[..n].copy_from_slice(&bag[..n]);
         engine::State { sq, bag: b, first_color, ply, no_progress }
     }
 
@@ -57,17 +58,15 @@ mod pyext {
 
     fn to_board(v: &[i8]) -> [i8; NSQ] {
         let mut b = [game::EMPTY; NSQ];
-        for i in 0..NSQ.min(v.len()) {
-            b[i] = v[i];
-        }
+        let n = NSQ.min(v.len());
+        b[..n].copy_from_slice(&v[..n]);
         b
     }
 
     fn vals8(values: Vec<f64>) -> [f64; 8] {
         let mut v = [0.0f64; 8];
-        for i in 0..8.min(values.len()) {
-            v[i] = values[i];
-        }
+        let n = 8.min(values.len());
+        v[..n].copy_from_slice(&values[..n]);
         v
     }
 
@@ -254,6 +253,7 @@ mod pyext {
 
     /// Nodes to complete a fixed-depth search (for the move-ordering efficiency probe).
     #[pyfunction]
+    #[allow(clippy::too_many_arguments)]
     fn search_nodes(squares: Vec<i16>, bag: Vec<u32>, first_color: i16, ply: u32, no_progress: u32,
                     depth: i32, w_mob: f64, values: Vec<f64>) -> u64 {
         let st = mk_masked(squares, bag, first_color, ply, no_progress);

@@ -143,6 +143,7 @@ fn index_of(board: &[i8; NSQ], stm: i8) -> u64 {
 }
 
 // ── per-combo placement enumeration (base=0 ⇒ yields the within-combo local index) ──
+#[allow(clippy::too_many_arguments)] // Recursive placement scratch buffers.
 fn enum_place(
     codes: &[i8; 16],
     depth: usize,
@@ -177,7 +178,7 @@ impl Bits {
     fn new(n: u64, fill: u8) -> Bits {
         let byte = (fill & 3) * 0b01010101;
         Bits {
-            data: vec![byte; ((n + 3) / 4) as usize],
+            data: vec![byte; n.div_ceil(4) as usize],
         }
     }
     #[inline]

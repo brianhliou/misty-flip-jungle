@@ -54,14 +54,12 @@ pub fn gen_moves(board: &[i8; NSQ], stm: i8, out: &mut Vec<(u8, u8)>) {
         let (f, r) = ((i as i32) % W, (i as i32) / W);
         for (df, dr) in ORTHO {
             let (nf, nr) = (f + df, r + dr);
-            if nf < 0 || nf >= W || nr < 0 || nr >= H {
+            if !(0..W).contains(&nf) || !(0..H).contains(&nr) {
                 continue;
             }
             let j = (nr * W + nf) as usize;
             let t = board[j];
-            if t < 0 {
-                out.push((i as u8, j as u8));
-            } else if pcolor(t) != stm && resolve(prole(c), prole(t)) != 0 {
+            if t < 0 || (pcolor(t) != stm && resolve(prole(c), prole(t)) != 0) {
                 out.push((i as u8, j as u8));
             }
         }
@@ -155,8 +153,8 @@ const fn build_d4() -> [[usize; NSQ]; 8] {
 #[inline]
 pub fn pack(board: &[i8; NSQ], stm: i8) -> u128 {
     let mut k: u128 = 0;
-    for i in 0..NSQ {
-        k |= ((board[i] + 1) as u128) << (5 * i);
+    for (i, &piece) in board.iter().enumerate() {
+        k |= ((piece + 1) as u128) << (5 * i);
     }
     (k << 1) | (stm as u128)
 }
@@ -173,8 +171,7 @@ fn colorswap_code(c: i8) -> i8 {
 /// Canonical key = min packed value over all 16 (D4 × colour-swap) symmetric variants.
 pub fn canonical(board: &[i8; NSQ], stm: i8) -> u128 {
     let mut best: u128 = u128::MAX;
-    for g in 0..8 {
-        let perm = &D4[g];
+    for perm in &D4 {
         // D4-transformed board
         let mut tb = [EMPTY; NSQ];
         for i in 0..NSQ {

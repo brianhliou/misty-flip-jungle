@@ -59,7 +59,7 @@ fn field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
 #[test]
 fn advertises_exact_options_and_release_version() {
     let output = run("uci\nisready\nquit\n", 0);
-    assert!(output.contains("id name MistyJungleFlip 0.5.4\n"));
+    assert!(output.contains("id name MistyJungleFlip 0.6.0\n"));
     assert_eq!(
         output
             .lines()
@@ -69,6 +69,7 @@ fn advertises_exact_options_and_release_version() {
             "option name Noise type string default 0",
             "option name NoiseDepth type spin default 1 min 1 max 8",
             "option name Seed type string default 0",
+            "option name EvalFile type string default <empty>",
         ]
     );
     assert!(output.ends_with("uciok\nreadyok\n"));

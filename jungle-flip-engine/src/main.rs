@@ -117,11 +117,15 @@ mod flatdb;
 #[allow(dead_code)] // engine.rs also exposes PyO3-facing helpers, unused here
 mod engine;
 
+#[path = "../../jungle_flip_rust/src/nnue.rs"]
+#[allow(dead_code)]
+mod nnue;
+
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::time::{Duration, Instant};
 
-const ENGINE_NAME: &str = "MistyJungleFlip 0.5.4";
+const ENGINE_NAME: &str = "MistyJungleFlip 0.6.0";
 /// Node budget for a `go` that names neither limit. Deliberately NOT a time budget: a bare
 /// `go` is the reproducible path the golden vectors depend on, and a wall clock would make it
 /// host-dependent.
@@ -295,6 +299,7 @@ fn search_best(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn search_best_with_play(
     p: &Parsed,
@@ -306,6 +311,23 @@ fn search_best_with_play(
     base_seed: u64,
     play: &engine::PlayOptions,
     rng: &mut engine::PlayRng,
+) -> (String, i64, engine::SearchStats) {
+    search_best_with_evaluator(p, node_budget, deadline, rep_seed, db, db_max,
+        base_seed, play, rng, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_best_with_evaluator(
+    p: &Parsed,
+    node_budget: u64,
+    deadline: Option<Instant>,
+    rep_seed: &[u64],
+    db: Option<engine::DbRef>,
+    db_max: usize,
+    base_seed: u64,
+    play: &engine::PlayOptions,
+    rng: &mut engine::PlayRng,
+    evaluator: Option<&dyn engine::LeafEvaluator>,
 ) -> (String, i64, engine::SearchStats) {
     let st = state_of(p);
     // Tie-break: exact-value ties among root moves (e.g. the opening flip, where all 16
@@ -319,7 +341,7 @@ fn search_best_with_play(
         let mixed = base_seed ^ st.rep_key();
         if mixed == 0 { base_seed } else { mixed }
     };
-    let ((frm, to), score, stats) = engine::select_move_scored_stats(
+    let ((frm, to), score, stats) = engine::select_move_with_evaluator(
         &st,
         node_budget,
         deadline,
@@ -336,6 +358,7 @@ fn search_best_with_play(
         rng_seed,
         play,
         rng,
+        evaluator,
     );
     if frm == 255 {
         ("(none)".to_string(), 0, stats)
@@ -407,6 +430,8 @@ fn main() {
     let mut current_reps: Vec<u64> = Vec::new();
     let mut play = engine::PlayOptions::default();
     let mut seed = 0;
+    let mut net = None;
+    let mut net_error = false;
     for line in stdin.lock().lines() {
         let line = match line {
             Ok(l) => l,
@@ -421,10 +446,27 @@ fn main() {
                 println!("option name Noise type string default 0");
                 println!("option name NoiseDepth type spin default 1 min 1 max 8");
                 println!("option name Seed type string default 0");
+                println!("option name EvalFile type string default <empty>");
                 println!("uciok");
             }
             "setoption" => {
-                if !set_play_option(line, &mut play, &mut seed) {
+                let rest = line.strip_prefix("setoption name ").unwrap_or("");
+                let (name, value) = rest.split_once(" value ")
+                    .unwrap_or((rest.strip_suffix(" value").unwrap_or(rest), ""));
+                if name.trim().eq_ignore_ascii_case("EvalFile") {
+                    net = None;
+                    net_error = false;
+                    let value = value.trim();
+                    if !value.is_empty() && value != "<empty>" {
+                        match nnue::Nnue::load(value) {
+                            Ok(loaded) => net = Some(loaded),
+                            Err(error) => {
+                                net_error = true;
+                                println!("info string error EvalFile: {error}; search disabled until EvalFile is replaced or cleared");
+                            }
+                        }
+                    }
+                } else if !set_play_option(line, &mut play, &mut seed) {
                     println!("info string invalid or unknown option");
                 }
             }
@@ -446,6 +488,10 @@ fn main() {
                     }
                 }
             }
+            "go" if net_error => {
+                println!("info string error EvalFile: search disabled until EvalFile is replaced or cleared");
+                println!("bestmove (none)");
+            }
             "go" => {
                 // The clock starts when the `go` arrives, not after parsing: the caller's
                 // movetime covers everything it is waiting on.
@@ -458,10 +504,11 @@ fn main() {
                         let base = if seed == 0 { tie_base_seed() } else { seed };
                         let random_base = if seed == 0 { entropy_seed() } else { seed };
                         let position_seed = random_base ^ state_of(p).rep_key();
-                        let (uci, cp, stats) = search_best_with_play(
+                        let (uci, cp, stats) = search_best_with_evaluator(
                             p, budget, deadline, &current_reps,
                             db.as_ref().map(LeafDb::as_ref), db_max, base, &play,
                             &mut engine::PlayRng::new(position_seed),
+                            net.as_ref().map(|n| n as &dyn engine::LeafEvaluator),
                         );
                         let elapsed_ms = started.elapsed().as_millis() as u64;
                         if uci == "(none)" {

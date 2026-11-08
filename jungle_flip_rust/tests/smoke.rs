@@ -8,7 +8,7 @@ use jungle_flip_rust::flatdb;
 fn builds_two_piece_tablebase() {
     // Solve every position with up to two pieces by retrograde analysis.
     let (db, stats) = flatdb::build(2);
-    let total: u64 = stats.iter().map(|s| s.0 as u64).sum();
+    let total: u64 = stats.iter().map(|s| s.0).sum();
     assert!(total > 0, "expected the 2-piece tablebase to resolve some positions");
     assert!(db.max_pieces() >= 2, "tablebase should cover positions up to two pieces");
 }

@@ -7,7 +7,7 @@
 A Flip Jungle (翻翻棋, hidden-identity animal chess) engine in Rust: alpha-beta with Star1
 chance-node pruning, a transposition table, quiescence, and killer/history move ordering, plus
 exact retrograde-analysis endgame tablebases that store distance-to-mate, so the engine finishes a
-won endgame by the shortest forced line instead of holding it forever. No neural network. The
+won endgame by the shortest forced line. Version 0.6.0 adds optional NNUE leaf evaluation. The
 search core is exposed to Python via PyO3, and the tablebase builder ships as a standalone binary.
 
 Flip Jungle is a 4×4 game: sixteen animals, eight a side, all face-down at the start. On your turn
@@ -59,6 +59,12 @@ Python bindings (`jungle_flip_rust`: search, move generation, tablebase queries)
 maturin develop --release
 ```
 
+The browser build requires `wasm-pack`:
+
+```bash
+wasm-pack build jungle-flip-wasm --target web --release
+```
+
 ## Determinism and opening variety
 
 Every position with a unique best move is deterministic: strength is a node budget, so
@@ -76,15 +82,28 @@ the box. Set `JF_TIE_SEED` to pin it:
 - `JF_TIE_SEED=<nonzero>` — reproducible variety: the same seed always yields the same game, a
   different seed a different one. Generate and log one per game to get variety and exact replay.
 
-## Weaker play
+## UCI options
 
 The UCI binary accepts these options with `setoption name <name> value <value>`:
 
 | Option | Default | Values and behavior |
 | --- | --- | --- |
+| `EvalFile` | empty | Path to a JFNN v2 evaluation file. Empty or `<empty>` uses classical evaluation, with the same search behavior as 0.5.4. |
 | `Noise` | `0` | Finite, nonnegative Gaussian standard deviation in the engine's [-1, 1] score units. Fractional values are accepted. Zero keeps the normal search; larger values make weaker choices. |
 | `NoiseDepth` | `1` | Integer from 1 to 8. Scores each root move at this depth before adding noise. Higher depths search more replies. |
 | `Seed` | `0` | Unsigned 64-bit integer. A nonzero value makes choices reproducible for the same position and settings. Zero uses fresh noise entropy and keeps the `JF_TIE_SEED` policy for exact ties. |
+
+The trained net is not published yet; no evaluation file ships with the engine.
+Load an external file with `setoption name EvalFile value /path/to/evaluation.jfnn`.
+Paths may contain spaces. A missing or invalid file reports `info string error EvalFile`
+and disables search (`bestmove (none)`) until `EvalFile` is replaced or cleared.
+
+The net sees only the public board and unrevealed piece counts. It replaces heuristic
+leaves, including capture quiescence; exact tablebases and terminal results retain
+precedence. Star1 chance search, repetition, win-distance scoring, node/time limits
+and weak-play settings keep their existing behavior. ChanceMix is not enabled.
+The browser/wasm build remains classical and does not include the net loader.
+See [0.6.0 validation](docs/0.6.0-validation.md) for checks and local timings.
 
 Settings survive `ucinewgame`. With noise enabled, the engine takes an immediate win
 and avoids moves that allow an immediate loss when a safe move exists, checking every
